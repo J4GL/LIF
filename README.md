@@ -12,6 +12,8 @@ Nothing is written to disk. The catalog lives in memory and disappears when the 
 > so it never transfers file content. It is meant for learning how the protocols work. Run it
 > briefly, on your own connection, and respect local law. The web page binds to `127.0.0.1`.
 
+![DHT scraper web page](media/capture.png)
+
 ## What it does
 
 - Runs `--nodes` DHT nodes (default 8) on consecutive UDP ports with one thread and one `select()`.
