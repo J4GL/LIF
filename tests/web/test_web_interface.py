@@ -46,8 +46,16 @@ class WebInterfaceTest(unittest.TestCase):
 
     def test_RUNTIME_002_page_shows_pipeline_counters(self):
         _, body = self.get("/")
-        keys = ("hashes_seen", "hashes_discovered", "with_metadata", "fetch_connections", "fetch_attempts", "fetch_in_progress", "fetch_failed", "lookups_started", "samples_received", "packets_sent", "packets_received")
+        keys = ("hashes_seen", "with_metadata", "fetch_connections", "fetch_attempts", "fetch_in_progress", "fetch_failed", "lookups_started", "samples_received", "packets_sent", "packets_received")
         self.assertEqual([key for key in keys if ('data-stat="%s"' % key).encode() not in body], [])
+        self.assertNotIn(b'data-stat="hashes_discovered"', body)
+
+    def test_RUNTIME_004_detail_panel_hides_peers(self):
+        _, body = self.get("/")
+        for removed in (b"Candidate peers", b"detail-peers", b"fetched from"):
+            self.assertNotIn(removed, body)
+        for kept in (b'id="detail-fields"', b'id="detail-files"', b'"fetched at"'):
+            self.assertIn(kept, body)
 
     def test_api_stats_returns_provider_payload(self):
         response, body = self.get("/api/stats")

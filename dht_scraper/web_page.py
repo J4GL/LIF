@@ -43,7 +43,6 @@ INDEX_PAGE_HTML = """<!DOCTYPE html>
     <span>uptime <b data-stat="uptime_seconds">0</b>s</span>
     <span>nodes <b data-stat="nodes">0</b></span>
     <span>hashes <b data-stat="hashes_seen">0</b></span>
-    <span>discovered <b data-stat="hashes_discovered">0</b></span>
     <span>with metadata <b data-stat="with_metadata">0</b></span>
     <span>connections <b data-stat="fetch_connections">0</b></span>
     <span>fetch attempts <b data-stat="fetch_attempts">0</b></span>
@@ -76,8 +75,6 @@ INDEX_PAGE_HTML = """<!DOCTYPE html>
     <dl id="detail-fields"></dl>
     <h3>Files</h3>
     <div id="files"><table><thead><tr><th>Path</th><th class="num">Length</th></tr></thead><tbody id="detail-files"></tbody></table></div>
-    <h3>Candidate peers</h3>
-    <p id="detail-peers" class="muted"></p>
   </aside>
 </main>
 <script>
@@ -141,7 +138,6 @@ INDEX_PAGE_HTML = """<!DOCTYPE html>
     if (meta) {
       addField(dl, "size", formatBytes(meta.size)); addField(dl, "piece length", formatBytes(meta.piece_length));
       addField(dl, "files", String(meta.file_count)); addField(dl, "private", meta.is_private ? "yes" : "no");
-      addField(dl, "fetched from", meta.source_peer ? meta.source_peer.ip + ":" + meta.source_peer.port : "-");
       addField(dl, "fetched at", formatTime(meta.fetched_at));
     }
     addField(dl, "fetch state", detail.fetch_state + " (attempts " + detail.fetch_attempts + (detail.last_error ? ", last error " + detail.last_error : "") + ")");
@@ -149,7 +145,6 @@ INDEX_PAGE_HTML = """<!DOCTYPE html>
     addField(dl, "first seen", formatTime(detail.first_seen)); addField(dl, "last seen", formatTime(detail.last_seen));
     var files = document.getElementById("detail-files"); clearChildren(files);
     (meta ? meta.files : []).forEach(function (f) { var tr = document.createElement("tr"); cell(tr, f.path); cell(tr, formatBytes(f.length), "num"); files.appendChild(tr); });
-    document.getElementById("detail-peers").textContent = detail.peers.length ? detail.peers.map(function (p) { return p.ip + ":" + p.port; }).join(", ") : "none";
     panel.hidden = false;
   }
 
