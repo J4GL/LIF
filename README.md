@@ -88,53 +88,6 @@ queries, at most 420 lookup queries, the replies to other nodes and a few uTP pa
 most 256 TCP connections. No address receives more than 40 packets in 10 s, below libtorrent's
 ban threshold. Lower `--batch-size` or `--fetch-workers` on a slow link.
 
-## Architecture
-
-```mermaid
-flowchart LR
-    subgraph process[dht_scraper process]
-        direction LR
-        subgraph crawler[crawler thread]
-            S1[(node socket 1)] --- SEL[selector]
-            S2[(node socket 2)] --- SEL
-            SN[(node socket N)] --- SEL
-            SEL --> H[handle_datagram]
-            Q[node queue] --> CS[crawl_step]
-            L[LookupManager]
-        end
-        CAT[(TorrentCatalog<br/>in memory, one lock)]
-        subgraph fetching[fetch thread: one asyncio loop]
-            FE[FetchEngine] --> J1[job: hash + peers]
-            FE --> J2[job: hash + peers]
-            U[(uTP socket)]
-        end
-        WEB[web thread<br/>ThreadingHTTPServer]
-    end
-    DHT((mainline DHT<br/>UDP)) <--> S1
-    DHT <--> S2
-    DHT <--> SN
-    H --> CAT
-    L -->|"peers as they arrive"| CAT
-    FE --> CAT
-    J1 -->|"BEP 10 / BEP 9 over TCP, MSE or uTP"| PEERS((peers))
-    J2 --> PEERS
-    U --- PEERS
-    WEB --> CAT
-    BROWSER[browser] <-->|"HTTP JSON"| WEB
-```
-
-| Thread | Count | Job |
-|---|---|---|
-| main | 1 | starts everything, waits, handles Ctrl-C, stops everything |
-| crawler | 1 | one selector over all node sockets, crawl queues, lookups |
-| fetch | 0 or 1 | one asyncio loop: claims candidates, runs up to `--fetch-workers` connections and 48 uTP connections |
-| web | 1 | serves the page and the JSON API |
-
-Shutdown order: set the stop event, stop the web server, join the fetch engine (it cancels every
-attempt and releases every claim within about a second), join the crawler, close the sockets,
-print a final summary. If the crawler is still blocked in a slow DNS lookup after its 5 s join
-timeout, its sockets are left open rather than closed under it, and a warning is logged.
-
 ## How the DHT crawl works
 
 ```mermaid
@@ -211,29 +164,6 @@ same time. A sampled hash comes from the sampling node's own peer storage, so th
 that node first; libtorrent keeps its sample for up to 6 hours while peers expire after about
 45 minutes, so about a third of these first answers carry peers and the others lead to closer nodes.
 
-## The in-memory catalog
-
-Per hash: `seen_count`, `announce_count`, `first_seen`, `last_seen`, up to 32 candidate peers,
-the peers that already failed, fetch state, attempts, lookup state, and the metadata once fetched.
-
-```mermaid
-stateDiagram-v2
-    [*] --> pending: first sighting
-    pending --> in_progress: claimed by the fetch engine (has peers)
-    in_progress --> done: metadata stored (SHA-1 verified)
-    in_progress --> pending: every peer failed, untried peers or lookups left (at once)
-    in_progress --> failed: 3 attempts, or no peer and no lookup left
-    pending --> failed: 2 lookups found no peers
-    done --> [*]
-    failed --> [*]
-```
-
-Capacity is 250 000 entries. When full, 5 % are evicted: first the oldest entries seen once
-without metadata and without peers, then the lowest `(metadata, peers, seen count, last seen)`.
-Entries that are in progress or being looked up are never evicted. Fetch candidates are ranked
-by `(seen_count, last_seen)` on every call; lookups take the most recently observed hashes first.
-A peer that failed for a hash is never added back to it.
-
 ## Metadata download (BEP 10 + BEP 9)
 
 ```mermaid
@@ -299,42 +229,6 @@ a reply only from the address it asked, and pushes peers to the catalog as soon 
 answer arrives. All lookups share a budget of 420 queries per second, at most 256 run at once, and
 at most 4 queries are in flight to the same node. The fetch engine claims candidates only while
 connection slots are free, so the ranking is always recomputed on fresh counters.
-
-## Web page
-
-| Route | Returns |
-|---|---|
-| `/` | the page (inline CSS and JavaScript, no external assets) |
-| `/api/stats` | one flat JSON object with all counters |
-| `/api/search?q=&limit=` | `{query, limit, count, results: [...]}` ranked by seen count |
-| `/api/torrent/<40 hex>` | counters, fetch state, peers, metadata with the full file list |
-
-```mermaid
-sequenceDiagram
-    participant B as browser
-    participant S as web thread
-    B->>S: GET /
-    S-->>B: page
-    loop every 2 s
-        B->>S: GET /api/stats
-        S-->>B: counters
-    end
-    B->>S: GET /api/search?q=ubuntu
-    S-->>B: ranked results with magnet links
-    B->>S: GET /api/torrent/<hex>
-    S-->>B: detail with file list and peers
-```
-
-Example search result:
-
-```json
-{"info_hash": "0a0a...", "name": "ubuntu-24.04.iso", "size": 6114656256, "file_count": 1,
- "seen_count": 17, "announce_count": 4, "first_seen": 1725000000.0, "last_seen": 1725000300.0,
- "magnet": "magnet:?xt=urn:btih:0a0a...&dn=ubuntu-24.04.iso"}
-```
-
-All data reaches the page as JSON and is rendered with `textContent`, so torrent names can
-never inject HTML. The page is served with a strict Content-Security-Policy.
 
 ## Logging
 
@@ -428,4 +322,4 @@ The specification lives in `spec/`, indexed by `spec/README.md`.
 
 ## License
 
-MIT. See [LICENSE](LICENSE).
+CC0 1.0 Universal (public domain dedication). See [LICENSE](LICENSE).
