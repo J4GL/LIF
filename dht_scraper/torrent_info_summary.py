@@ -105,7 +105,7 @@ def build_search_text(name: str, files: Sequence[TorrentFile]) -> str:
     return result
 
 
-# Parents: FetchWorkerPool.process_candidate
+# Parents: FetchEngine.attempt
 # Keywords: info dict, summarize, metadata, validation
 def summarize_info_dict(info_hash: bytes, info: Any, fetched_at: float, source_peer: Optional[Peer]) -> TorrentMetadata:
     assert len(info_hash) == NODE_ID_LENGTH and fetched_at >= 0

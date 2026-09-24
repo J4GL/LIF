@@ -43,10 +43,13 @@ INDEX_PAGE_HTML = """<!DOCTYPE html>
     <span>uptime <b data-stat="uptime_seconds">0</b>s</span>
     <span>nodes <b data-stat="nodes">0</b></span>
     <span>hashes <b data-stat="hashes_seen">0</b></span>
+    <span>discovered <b data-stat="hashes_discovered">0</b></span>
     <span>with metadata <b data-stat="with_metadata">0</b></span>
-    <span>fetch queue <b data-stat="fetch_queue_size">0</b></span>
+    <span>connections <b data-stat="fetch_connections">0</b></span>
+    <span>fetch attempts <b data-stat="fetch_attempts">0</b></span>
     <span>in progress <b data-stat="fetch_in_progress">0</b></span>
     <span>failed <b data-stat="fetch_failed">0</b></span>
+    <span>lookups <b data-stat="lookups_started">0</b></span>
     <span>samples <b data-stat="samples_received">0</b></span>
     <span>sent <b data-stat="packets_sent">0</b></span>
     <span>received <b data-stat="packets_received">0</b></span>
@@ -98,7 +101,7 @@ INDEX_PAGE_HTML = """<!DOCTYPE html>
       var spans = document.querySelectorAll("[data-stat]");
       for (var i = 0; i < spans.length; i += 1) {
         var key = spans[i].getAttribute("data-stat"); var value = stats[key];
-        spans[i].textContent = key === "uptime_seconds" ? Math.round(value) : String(value);
+        spans[i].textContent = value === undefined ? "-" : (key === "uptime_seconds" ? Math.round(value) : String(value));
       }
     }).catch(function () {});
   }

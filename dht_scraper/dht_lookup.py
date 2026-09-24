@@ -1,32 +1,44 @@
-"""Iterative get_peers lookups (Kademlia style) driven from the crawler thread without blocking."""
+"""Continuous get_peers lookups (Kademlia style) driven from the crawler thread without blocking."""
 import logging
 import time
-from typing import Callable, Dict, Iterable, List, Optional, Set, Tuple
+from typing import Callable, Dict, Iterable, List, NamedTuple, Optional, Set, Tuple
 
 from dht_scraper.event_log import LOGGER_NAME
-from dht_scraper.krpc_messages import Address, Node, decode_compact_nodes, decode_compact_peers, is_routable_address
-from dht_scraper.node_identity import NODE_ID_LENGTH, generate_lookup_transaction_id, is_valid_node_id, select_closest_nodes
+from dht_scraper.krpc_messages import Address, Node, decode_compact_nodes, decode_compact_nodes6, decode_compact_peers, is_routable_address
+from dht_scraper.node_identity import NODE_ID_LENGTH, is_valid_node_id, lookup_transaction_id, select_closest_nodes
 
 LOGGER = logging.getLogger(LOGGER_NAME)
 
-LOOKUP_ALPHA = 8
-LOOKUP_MAX_ROUNDS = 4
-LOOKUP_QUERY_TIMEOUT = 2.0
-LOOKUP_DEADLINE = 8.0
-LOOKUP_MAX_ACTIVE = 16
-LOOKUP_SHORTLIST_SIZE = 32
-LOOKUP_MAX_PEERS = 50
-LOOKUP_MIN_PEERS = 1
+
+class LookupLimits(NamedTuple):
+    """Tunable limits of the lookups; see spec/lookup/contract.md."""
+
+    alpha: int = 1
+    query_timeout: float = 1.5
+    hint_timeout: float = 1.0
+    deadline: float = 6.0
+    max_queries: int = 16
+    enough_peers: int = 8
+    max_value_responses: int = 2
+    max_active: int = 256
+    queries_per_second: float = 420.0
+    max_per_node: int = 4
+    shortlist_size: int = 32
+    max_peers: int = 50
+
+
+DEFAULT_LOOKUP_LIMITS = LookupLimits()
 
 SendQuery = Callable[[bytes, Node, bytes], None]
 OnFinished = Callable[[bytes, List[Address]], None]
+OnPeers = Callable[[bytes, List[Address]], object]
 NodeFilter = Callable[[Node], bool]
 
 
 class PeerLookup:
     """State of one get_peers lookup."""
 
-    __slots__ = ("info_hash", "shortlist", "queried", "pending", "found_peers", "rounds_sent", "deadline", "finished")
+    __slots__ = ("info_hash", "shortlist", "queried", "pending", "found_peers", "queries_sent", "value_responses", "hint_transaction", "deadline", "finished")
 
     # Parents: LookupManager.start_lookup
     # Keywords: lookup, state, shortlist, pending
@@ -36,8 +48,10 @@ class PeerLookup:
         self.shortlist: Dict[bytes, Node] = {}
         self.queried: Set[Address] = set()
         self.pending: Dict[bytes, Tuple[Address, float]] = {}
-        self.found_peers: Set[Address] = set()
-        self.rounds_sent = 0
+        self.found_peers: Dict[Address, None] = {}
+        self.queries_sent = 0
+        self.value_responses = 0
+        self.hint_transaction: Optional[bytes] = None
         self.deadline = deadline
         self.finished = False
         assert not self.finished and not self.pending
@@ -50,30 +64,59 @@ def accept_every_node(node: Node) -> bool:
     return True
 
 
+# Parents: LookupManager.add_to_shortlist, LookupManager.start_lookup
+# Keywords: node, validation, filter
+def is_usable_node(node: Node, node_filter: NodeFilter) -> bool:
+    assert callable(node_filter)
+    result = len(node) == 3 and is_valid_node_id(node[0]) and node_filter(node)
+    assert isinstance(result, bool)
+    return result
+
+
 class LookupManager:
-    """Runs up to LOOKUP_MAX_ACTIVE lookups. All methods are called from the crawler thread."""
+    """Runs up to `limits.max_active` lookups. All methods are called from the crawler thread."""
 
     # Parents: DhtCrawler.__init__
-    # Keywords: lookup manager, callbacks, clock
-    def __init__(self, send_query: SendQuery, on_finished: OnFinished, clock: Callable[[], float] = time.monotonic, node_filter: NodeFilter = accept_every_node) -> None:
+    # Keywords: lookup manager, callbacks, clock, limits, token bucket
+    def __init__(
+        self,
+        send_query: SendQuery,
+        on_finished: OnFinished,
+        clock: Callable[[], float] = time.monotonic,
+        node_filter: NodeFilter = accept_every_node,
+        on_peers: Optional[OnPeers] = None,
+        limits: LookupLimits = DEFAULT_LOOKUP_LIMITS,
+    ) -> None:
         assert callable(send_query) and callable(on_finished) and callable(clock)
+        assert limits.alpha >= 1 and limits.max_active >= 1 and limits.queries_per_second > 0 and limits.max_per_node >= 1
         self.send_query = send_query
         self.on_finished = on_finished
+        self.on_peers = on_peers
         self.clock = clock
         self.node_filter = node_filter
+        self.limits = limits
         self.active: Dict[bytes, PeerLookup] = {}
         self.transactions: Dict[bytes, bytes] = {}
+        self.in_flight: Dict[Address, int] = {}
+        self.tokens = float(limits.queries_per_second)
+        self.tokens_time = clock()
+        self.sequence = 0
         self.started_total = 0
         self.finished_total = 0
+        self.with_peers_total = 0
         self.peers_found_total = 0
+        self.queries_total = 0
+        self.hint_queries = 0
+        self.hint_answers = 0
+        self.hint_values = 0
         assert not self.active and not self.transactions
 
     # Parents: DhtCrawler.start_pending_lookups
     # Keywords: capacity, slots, active lookups
     def free_slots(self) -> int:
-        assert len(self.active) <= LOOKUP_MAX_ACTIVE
-        result = LOOKUP_MAX_ACTIVE - len(self.active)
-        assert 0 <= result <= LOOKUP_MAX_ACTIVE
+        assert len(self.active) <= self.limits.max_active
+        result = self.limits.max_active - len(self.active)
+        assert 0 <= result <= self.limits.max_active
         return result
 
     # Parents: DhtCrawler.handle_response, DhtCrawler.handle_error
@@ -84,20 +127,38 @@ class LookupManager:
         assert isinstance(result, bool)
         return result
 
+    # Parents: start_lookup, top_up, tick
+    # Keywords: token bucket, refill, query budget
+    def refill(self, now: float) -> float:
+        assert now >= 0
+        elapsed = max(0.0, now - self.tokens_time)
+        self.tokens = min(float(self.limits.queries_per_second), self.tokens + elapsed * self.limits.queries_per_second)
+        self.tokens_time = max(self.tokens_time, now)
+        assert 0 <= self.tokens <= self.limits.queries_per_second
+        return self.tokens
+
     # Parents: DhtCrawler.start_pending_lookups
-    # Keywords: start, seed nodes, first round
-    def start_lookup(self, info_hash: bytes, seed_nodes: Iterable[Node], now: float) -> bool:
+    # Keywords: start, seed nodes, hint node, first query
+    def start_lookup(self, info_hash: bytes, seed_nodes: Iterable[Node], now: float, hint: Optional[Node] = None) -> bool:
         assert len(info_hash) == NODE_ID_LENGTH
-        if info_hash in self.active or self.free_slots() == 0:
+        if info_hash in self.active or self.free_slots() == 0 or self.refill(now) < 1:
             return False
-        lookup = PeerLookup(info_hash, now + LOOKUP_DEADLINE)
+        if hint is not None and not is_usable_node(hint, self.node_filter):
+            hint = None
+        if hint is not None and self.in_flight.get((hint[1], hint[2]), 0) >= self.limits.max_per_node:
+            return False
+        lookup = PeerLookup(info_hash, now + self.limits.deadline)
         self.add_to_shortlist(lookup, seed_nodes)
-        if not lookup.shortlist:
+        if hint is None and not lookup.shortlist:
             return False
         self.active[info_hash] = lookup
         self.started_total += 1
-        self.send_round(lookup, now)
-        LOGGER.debug("lookup started for %s with %d seed nodes", info_hash.hex(), len(lookup.shortlist))
+        if hint is not None:
+            lookup.hint_transaction = self.send_to(lookup, hint, now, self.limits.hint_timeout)
+            self.hint_queries += 1
+        else:
+            self.top_up(lookup, now)
+        LOGGER.debug("lookup started for %s with %d seed nodes, hint %s", info_hash.hex(), len(lookup.shortlist), hint is not None)
         assert info_hash in self.active
         return True
 
@@ -106,33 +167,76 @@ class LookupManager:
     def add_to_shortlist(self, lookup: PeerLookup, nodes: Iterable[Node]) -> None:
         assert isinstance(lookup, PeerLookup)
         for node in nodes:
-            if is_valid_node_id(node[0]) and self.node_filter(node) and (node[1], node[2]) not in lookup.queried:
+            if is_usable_node(node, self.node_filter) and (node[1], node[2]) not in lookup.queried:
                 lookup.shortlist[node[0]] = node
-        if len(lookup.shortlist) > LOOKUP_SHORTLIST_SIZE:
-            closest = select_closest_nodes(lookup.shortlist.values(), lookup.info_hash, LOOKUP_SHORTLIST_SIZE)
+        if len(lookup.shortlist) > self.limits.shortlist_size:
+            closest = select_closest_nodes(lookup.shortlist.values(), lookup.info_hash, self.limits.shortlist_size)
             lookup.shortlist = {node[0]: node for node in closest}
-        assert len(lookup.shortlist) <= LOOKUP_SHORTLIST_SIZE
+        assert len(lookup.shortlist) <= self.limits.shortlist_size
+
+    # Parents: start_lookup, top_up
+    # Keywords: send, transaction, pending, in flight, token
+    def send_to(self, lookup: PeerLookup, node: Node, now: float, timeout: float) -> bytes:
+        assert not lookup.finished and timeout > 0
+        transaction_id = lookup_transaction_id(self.sequence)
+        self.sequence += 1
+        address = (node[1], node[2])
+        lookup.pending[transaction_id] = (address, now + timeout)
+        lookup.queried.add(address)
+        lookup.queries_sent += 1
+        self.transactions[transaction_id] = lookup.info_hash
+        self.in_flight[address] = self.in_flight.get(address, 0) + 1
+        self.tokens -= 1
+        self.queries_total += 1
+        self.send_query(transaction_id, node, lookup.info_hash)
+        assert transaction_id in self.transactions
+        return transaction_id
+
+    # Parents: handle_response, handle_error, expire_pending, finish
+    # Keywords: release, pending, in flight, hint
+    def release_transaction(self, lookup: PeerLookup, transaction_id: bytes) -> None:
+        assert transaction_id in lookup.pending
+        address, _ = lookup.pending.pop(transaction_id)
+        self.transactions.pop(transaction_id, None)
+        remaining = self.in_flight.get(address, 0) - 1
+        if remaining > 0:
+            self.in_flight[address] = remaining
+        else:
+            self.in_flight.pop(address, None)
+        if lookup.hint_transaction == transaction_id:
+            lookup.hint_transaction = None
+        assert transaction_id not in self.transactions
 
     # Parents: start_lookup, advance
-    # Keywords: round, alpha, send, closest unqueried
-    def send_round(self, lookup: PeerLookup, now: float) -> int:
-        assert not lookup.finished and lookup.rounds_sent < LOOKUP_MAX_ROUNDS
-        unqueried = [node for node in lookup.shortlist.values() if (node[1], node[2]) not in lookup.queried]
+    # Keywords: top up, alpha in flight, closest unqueried, budget
+    def top_up(self, lookup: PeerLookup, now: float) -> int:
+        assert not lookup.finished
+        free = min(self.limits.alpha - len(lookup.pending), self.limits.max_queries - lookup.queries_sent)
+        if free <= 0 or self.refill(now) < 1:
+            return 0
+        candidates = [
+            node for node in lookup.shortlist.values()
+            if (node[1], node[2]) not in lookup.queried and self.in_flight.get((node[1], node[2]), 0) < self.limits.max_per_node
+        ]
         sent = 0
-        for node in select_closest_nodes(unqueried, lookup.info_hash, LOOKUP_ALPHA):
-            transaction_id = generate_lookup_transaction_id()
-            address = (node[1], node[2])
-            lookup.pending[transaction_id] = (address, now + LOOKUP_QUERY_TIMEOUT)
-            lookup.queried.add(address)
-            self.transactions[transaction_id] = lookup.info_hash
-            self.send_query(transaction_id, node, lookup.info_hash)
+        for node in select_closest_nodes(candidates, lookup.info_hash, free):
+            if self.tokens < 1:
+                break
+            self.send_to(lookup, node, now, self.limits.query_timeout)
             sent += 1
-        lookup.rounds_sent += 1
-        assert 0 <= sent <= LOOKUP_ALPHA
+        assert 0 <= sent <= self.limits.alpha
         return sent
 
+    # Parents: advance
+    # Keywords: convergence, unqueried, query cap
+    def can_query_more(self, lookup: PeerLookup) -> bool:
+        assert isinstance(lookup, PeerLookup)
+        result = lookup.queries_sent < self.limits.max_queries and any((node[1], node[2]) not in lookup.queried for node in lookup.shortlist.values())
+        assert isinstance(result, bool)
+        return result
+
     # Parents: DhtCrawler.handle_response
-    # Keywords: response, values, nodes, advance
+    # Keywords: response, values, stream peers, nodes, advance
     def handle_response(self, transaction_id: bytes, response: object, address: Address) -> None:
         assert self.owns_transaction(transaction_id)
         info_hash = self.transactions[transaction_id]
@@ -140,15 +244,25 @@ class LookupManager:
         if lookup is None or lookup.pending.get(transaction_id, (None, 0.0))[0] != address:
             LOGGER.debug("lookup response for %s ignored: unexpected sender %s", transaction_id.hex(), address)
             return
-        del self.transactions[transaction_id]
-        del lookup.pending[transaction_id]
+        from_hint = lookup.hint_transaction == transaction_id
+        self.release_transaction(lookup, transaction_id)
+        self.hint_answers += 1 if from_hint else 0
         if isinstance(response, dict):
-            for peer in decode_compact_peers(response.get(b"values")):
-                if is_routable_address(peer[0], peer[1]) and len(lookup.found_peers) < LOOKUP_MAX_PEERS:
-                    lookup.found_peers.add(peer)
-            compact_nodes = response.get(b"nodes")
-            if isinstance(compact_nodes, bytes):
-                self.add_to_shortlist(lookup, decode_compact_nodes(compact_nodes))
+            values = decode_compact_peers(response.get(b"values"))
+            self.hint_values += 1 if from_hint and values else 0
+            new_peers: List[Address] = []
+            for peer in values:
+                if is_routable_address(peer[0], peer[1]) and peer not in lookup.found_peers and len(lookup.found_peers) < self.limits.max_peers:
+                    lookup.found_peers[peer] = None
+                    new_peers.append(peer)
+            if values:
+                lookup.value_responses += 1
+            if new_peers and self.on_peers is not None:
+                self.on_peers(info_hash, new_peers)
+            for key, decoder in ((b"nodes", decode_compact_nodes), (b"nodes6", decode_compact_nodes6)):
+                compact_nodes = response.get(key)
+                if isinstance(compact_nodes, bytes):
+                    self.add_to_shortlist(lookup, decoder(compact_nodes))
         self.advance(lookup, self.clock())
         assert transaction_id not in lookup.pending
 
@@ -156,11 +270,12 @@ class LookupManager:
     # Keywords: error, pending, drop
     def handle_error(self, transaction_id: bytes) -> None:
         assert self.owns_transaction(transaction_id)
-        info_hash = self.transactions.pop(transaction_id)
-        lookup = self.active.get(info_hash)
-        if lookup is not None:
-            lookup.pending.pop(transaction_id, None)
+        lookup = self.active.get(self.transactions[transaction_id])
+        if lookup is not None and transaction_id in lookup.pending:
+            self.release_transaction(lookup, transaction_id)
             self.advance(lookup, self.clock())
+        else:
+            self.transactions.pop(transaction_id, None)
         assert transaction_id not in self.transactions
 
     # Parents: tick
@@ -169,38 +284,38 @@ class LookupManager:
         assert isinstance(lookup, PeerLookup)
         expired = [transaction_id for transaction_id, (_, expiry) in lookup.pending.items() if expiry <= now]
         for transaction_id in expired:
-            del lookup.pending[transaction_id]
-            self.transactions.pop(transaction_id, None)
+            self.release_transaction(lookup, transaction_id)
         assert all(expiry > now for _, expiry in lookup.pending.values())
         return len(expired)
 
     # Parents: handle_response, handle_error, tick
-    # Keywords: state machine, finish, next round
+    # Keywords: state machine, finish, top up, hint wait
     def advance(self, lookup: PeerLookup, now: float) -> None:
         assert isinstance(lookup, PeerLookup)
         if lookup.finished:
             return
-        if now >= lookup.deadline or len(lookup.found_peers) >= LOOKUP_MIN_PEERS:
+        limits = self.limits
+        if now >= lookup.deadline or len(lookup.found_peers) >= limits.enough_peers or lookup.value_responses >= limits.max_value_responses:
             self.finish(lookup)
-        elif lookup.pending:
-            return
-        elif lookup.rounds_sent >= LOOKUP_MAX_ROUNDS or self.send_round(lookup, now) == 0:
-            self.finish(lookup)
-        assert lookup.finished or lookup.pending
+        elif lookup.hint_transaction is None:
+            self.top_up(lookup, now)
+            if not lookup.pending and not self.can_query_more(lookup):
+                self.finish(lookup)
+        assert lookup.finished or lookup.info_hash in self.active
 
     # Parents: advance, abort_all
     # Keywords: finish, callback, cleanup
     def finish(self, lookup: PeerLookup) -> None:
         assert not lookup.finished
         lookup.finished = True
-        for transaction_id in lookup.pending:
-            self.transactions.pop(transaction_id, None)
-        lookup.pending.clear()
+        for transaction_id in list(lookup.pending):
+            self.release_transaction(lookup, transaction_id)
         self.active.pop(lookup.info_hash, None)
         self.finished_total += 1
         peers = sorted(lookup.found_peers)
         self.peers_found_total += len(peers)
-        LOGGER.debug("lookup finished for %s: %d peers after %d rounds", lookup.info_hash.hex(), len(peers), lookup.rounds_sent)
+        self.with_peers_total += 1 if peers else 0
+        LOGGER.debug("lookup finished for %s: %d peers after %d queries", lookup.info_hash.hex(), len(peers), lookup.queries_sent)
         self.on_finished(lookup.info_hash, peers)
         assert lookup.info_hash not in self.active
 
@@ -208,10 +323,28 @@ class LookupManager:
     # Keywords: tick, expire, advance, periodic
     def tick(self, now: float) -> None:
         assert now >= 0
+        self.refill(now)
         for lookup in list(self.active.values()):
             self.expire_pending(lookup, now)
             self.advance(lookup, now)
         assert all(not lookup.finished for lookup in self.active.values())
+
+    # Parents: DhtCrawler.snapshot_stats
+    # Keywords: statistics, counters, lookups, read from another thread, no cross-counter check
+    def snapshot_counts(self) -> Dict[str, int]:
+        assert self.limits.max_active >= 1
+        result = {
+            "lookups_finished": self.finished_total,
+            "lookups_with_peers": self.with_peers_total,
+            "lookup_peers_found": self.peers_found_total,
+            "lookup_queries_sent": self.queries_total,
+            "lookup_hint_queries": self.hint_queries,
+            "lookup_hint_answers": self.hint_answers,
+            "lookup_hint_values": self.hint_values,
+            "active_lookups": len(self.active),
+        }
+        assert all(value >= 0 for value in result.values())
+        return result
 
     # Parents: DhtCrawler.run
     # Keywords: abort, shutdown, finish all

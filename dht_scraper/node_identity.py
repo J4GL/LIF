@@ -68,16 +68,17 @@ def select_closest_nodes(nodes: Iterable[NodeTuple], target: bytes, count: int) 
     return result
 
 
-# Parents: LookupManager.send_round
-# Keywords: transaction id, lookup, prefix, random
-def generate_lookup_transaction_id() -> bytes:
-    assert LOOKUP_TRANSACTION_ID_LENGTH > len(LOOKUP_TRANSACTION_PREFIX)
-    result = LOOKUP_TRANSACTION_PREFIX + os.urandom(LOOKUP_TRANSACTION_ID_LENGTH - len(LOOKUP_TRANSACTION_PREFIX))
+# Parents: LookupManager.send_to
+# Keywords: transaction id, lookup, prefix, counter, unique in flight
+def lookup_transaction_id(sequence: int) -> bytes:
+    assert sequence >= 0 and LOOKUP_TRANSACTION_ID_LENGTH > len(LOOKUP_TRANSACTION_PREFIX)
+    counter_length = LOOKUP_TRANSACTION_ID_LENGTH - len(LOOKUP_TRANSACTION_PREFIX)
+    result = LOOKUP_TRANSACTION_PREFIX + (sequence % (1 << (8 * counter_length))).to_bytes(counter_length, "big")
     assert len(result) == LOOKUP_TRANSACTION_ID_LENGTH
     return result
 
 
-# Parents: FetchWorkerPool.__init__, fetch_metadata
+# Parents: opening_messages
 # Keywords: peer id, client prefix, random, handshake
 def generate_peer_id() -> bytes:
     assert len(PEER_ID_PREFIX) < NODE_ID_LENGTH

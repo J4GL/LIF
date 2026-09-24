@@ -58,7 +58,7 @@ class CatalogCountersTest(unittest.TestCase):
 
 class CatalogFetchStateTest(unittest.TestCase):
     def setUp(self):
-        self.catalog = TorrentCatalog(max_fetch_attempts=2, retry_seconds=10.0, max_lookups=2, lookup_retry_seconds=5.0)
+        self.catalog = TorrentCatalog(max_fetch_attempts=2, max_lookups=2, lookup_retry_seconds=5.0)
 
     def test_candidates_ordered_by_seen_count_and_reranked_live(self):
         self.catalog.record_hash(HASH_A, SOURCE_SAMPLE, peer=PEER_1, now=1.0)
@@ -80,19 +80,6 @@ class CatalogFetchStateTest(unittest.TestCase):
         self.assertEqual(self.catalog.snapshot_counts()["with_metadata"], 2)
         self.assertEqual([row["name"] for row in self.catalog.search("ubuntu", 10)], ["Ubuntu ISO"])
         self.assertEqual(self.catalog.torrent_detail(HASH_A)["fetch_state"], FETCH_DONE)
-
-    def test_mark_fetch_failed_retries_then_fails(self):
-        self.catalog.record_hash(HASH_A, SOURCE_SAMPLE, peer=PEER_1, now=0.0)
-        self.catalog.add_peers(HASH_A, [PEER_2])
-        self.catalog.next_fetch_candidates(1, now=1.0)
-        self.assertEqual(self.catalog.mark_fetch_failed(HASH_A, [PEER_1], "closed", now=1.0), FETCH_PENDING)
-        detail = self.catalog.torrent_detail(HASH_A)
-        self.assertEqual((detail["fetch_attempts"], detail["retry_after"], detail["last_error"]), (1, 11.0, "closed"))
-        self.assertEqual(detail["peers"], [{"ip": "2.2.2.2", "port": 2}])
-        self.assertEqual(self.catalog.next_fetch_candidates(1, now=5.0), [])
-        self.assertEqual(self.catalog.next_fetch_candidates(1, now=12.0), [(HASH_A, [PEER_2])])
-        self.assertEqual(self.catalog.mark_fetch_failed(HASH_A, [PEER_2], "timeout", now=12.0), FETCH_FAILED)
-        self.assertEqual(self.catalog.mark_fetch_failed(HASH_B, [], "x"), FETCH_FAILED)
 
     def test_release_fetch_claim(self):
         self.catalog.record_hash(HASH_A, SOURCE_SAMPLE, peer=PEER_1)
@@ -184,6 +171,127 @@ class CatalogEvictionAndSearchTest(unittest.TestCase):
         counts = catalog.snapshot_counts()
         self.assertEqual(counts["fetch_pending"] + counts["fetch_in_progress"] + counts["fetch_done"] + counts["fetch_failed"], counts["hashes_seen"])
         self.assertLessEqual(counts["hashes_seen"], 500 + counts["fetch_in_progress"] + counts["lookups_in_progress"])
+
+
+HASH_D = b"\x0d" * 20
+HASH_E = b"\x0e" * 20
+HASH_F = b"\x0f" * 20
+PEER_3 = ("3.3.3.3", 3)
+PEER_4 = ("4.4.4.4", 4)
+
+
+def numbered_hashes(prefix, count):
+    return [bytes([prefix, index]) + b"\x00" * 18 for index in range(count)]
+
+
+class CatalogFetchRetrySpecTest(unittest.TestCase):
+    def test_CATALOG_001_untried_peers_are_fetchable_at_once(self):
+        with self.subTest(case="untried peer added while in progress"):
+            catalog = TorrentCatalog(max_fetch_attempts=3)
+            catalog.record_hash(HASH_A, SOURCE_SAMPLE, peer=PEER_1, now=0.0)
+            self.assertEqual(catalog.next_fetch_candidates(1, now=1.0), [(HASH_A, [PEER_1])])
+            catalog.add_peers(HASH_A, [PEER_2])
+            self.assertEqual(catalog.mark_fetch_failed(HASH_A, [PEER_1], "connect_timeout", now=2.0), FETCH_PENDING)
+            self.assertEqual(catalog.next_fetch_candidates(1, now=2.0), [(HASH_A, [PEER_2])])
+            detail = catalog.torrent_detail(HASH_A)
+            self.assertEqual((detail["fetch_attempts"], detail["last_error"], detail["peers"]), (1, "connect_timeout", [{"ip": "2.2.2.2", "port": 2}]))
+        with self.subTest(case="no peer left, lookups remaining"):
+            catalog = TorrentCatalog(max_fetch_attempts=3)
+            catalog.record_hash(HASH_B, SOURCE_SAMPLE, peer=PEER_1, now=0.0)
+            catalog.next_fetch_candidates(1, now=1.0)
+            self.assertEqual(catalog.mark_fetch_failed(HASH_B, [PEER_1], "closed", now=2.0), FETCH_PENDING)
+            self.assertEqual(catalog.next_fetch_candidates(1, now=2.0), [])
+            self.assertEqual(catalog.hashes_needing_peers(1, now=2.0), [HASH_B])
+        with self.subTest(case="attempts exhausted"):
+            catalog = TorrentCatalog(max_fetch_attempts=3)
+            catalog.record_hash(HASH_C, SOURCE_SAMPLE, peer=PEER_1, now=0.0)
+            states = []
+            for tried, fresh in ((PEER_1, PEER_2), (PEER_2, PEER_3), (PEER_3, PEER_4)):
+                self.assertEqual(catalog.next_fetch_candidates(1, now=3.0), [(HASH_C, [tried])])
+                catalog.add_peers(HASH_C, [fresh])
+                states.append(catalog.mark_fetch_failed(HASH_C, [tried], "timeout", now=3.0))
+            self.assertEqual(states, [FETCH_PENDING, FETCH_PENDING, FETCH_FAILED])
+            self.assertEqual(catalog.next_fetch_candidates(1, now=3.0), [])
+
+    def test_CATALOG_002_failed_peer_is_never_added_back(self):
+        catalog = TorrentCatalog()
+        catalog.record_hash(HASH_A, SOURCE_SAMPLE, peer=PEER_1, now=0.0)
+        catalog.next_fetch_candidates(1, now=1.0)
+        catalog.mark_fetch_failed(HASH_A, [PEER_1], "closed", now=1.0)
+        self.assertEqual(catalog.add_peers(HASH_A, [PEER_1, PEER_2]), 1)
+        catalog.record_hash(HASH_A, SOURCE_ANNOUNCE_PEER, peer=PEER_1, now=2.0)
+        catalog.add_lookup_result(HASH_A, [PEER_1], now=2.0)
+        self.assertEqual(catalog.torrent_detail(HASH_A)["peers"], [{"ip": "2.2.2.2", "port": 2}])
+
+
+class CatalogLookupQueueSpecTest(unittest.TestCase):
+    def test_CATALOG_003_newest_sightings_are_looked_up_first(self):
+        catalog = TorrentCatalog(lookup_retry_seconds=30.0)
+        for info_hash in (HASH_A, HASH_B, HASH_C):
+            catalog.record_hash(info_hash, SOURCE_SAMPLE, now=0.0)
+        self.assertEqual(catalog.hashes_needing_peers(2, now=0.0), [HASH_C, HASH_B])
+        self.assertEqual(catalog.snapshot_counts()["lookups_in_progress"], 2)
+        catalog.record_hash(HASH_D, SOURCE_SAMPLE, now=0.0)
+        catalog.record_hash(HASH_A, SOURCE_SAMPLE, now=0.0)
+        self.assertEqual(catalog.hashes_needing_peers(5, now=0.0), [HASH_A, HASH_D])
+        catalog.record_hash(HASH_E, SOURCE_SAMPLE, peer=PEER_1, now=0.0)
+        catalog.record_hash(HASH_F, SOURCE_SAMPLE, now=0.0)
+        self.assertEqual(catalog.hashes_needing_peers(1, now=0.0), [HASH_F])
+        catalog.add_lookup_result(HASH_F, [], now=0.0)
+        self.assertEqual(catalog.hashes_needing_peers(5, now=1.0), [])
+        self.assertEqual(catalog.hashes_needing_peers(5, now=30.0), [HASH_F])
+
+
+class CatalogCapacitySpecTest(unittest.TestCase):
+    def test_CATALOG_004_eviction_order_and_claimed_entries(self):
+        with self.subTest(case="oldest entries seen once go first"):
+            catalog = TorrentCatalog(max_entries=40)
+            catalog.store_metadata(make_metadata(HASH_A, "kept"), now=0.0)
+            for _ in range(3):
+                catalog.record_hash(HASH_B, SOURCE_SAMPLE, peer=PEER_1, now=1.0)
+            self.assertEqual(catalog.next_fetch_candidates(1, now=1.0), [(HASH_B, [PEER_1])])
+            catalog.record_hash(HASH_C, SOURCE_SAMPLE, now=2.0)
+            self.assertEqual(catalog.hashes_needing_peers(1, now=2.0), [HASH_C])
+            hashes = numbered_hashes(0xE0, 60)
+            for index, info_hash in enumerate(hashes):
+                catalog.record_hash(info_hash, SOURCE_SAMPLE, now=10.0 + index)
+            counts = catalog.snapshot_counts()
+            self.assertEqual((counts["hashes_seen"], counts["evicted"]), (39, 24))
+            for kept in (HASH_A, HASH_B, HASH_C):
+                self.assertIsNotNone(catalog.torrent_detail(kept))
+            self.assertTrue(all(catalog.torrent_detail(info_hash) is not None for info_hash in hashes[24:]))
+            self.assertTrue(all(catalog.torrent_detail(info_hash) is None for info_hash in hashes[:24]))
+            self.assertEqual(counts["fetch_pending"] + counts["fetch_in_progress"] + counts["fetch_done"] + counts["fetch_failed"], counts["hashes_seen"])
+        with self.subTest(case="fallback sort when too few entries are seen once"):
+            catalog = TorrentCatalog(max_entries=40)
+            hashes = numbered_hashes(0xD0, 40)
+            for index, info_hash in enumerate(hashes):
+                catalog.record_hash(info_hash, SOURCE_SAMPLE, now=float(index))
+                catalog.record_hash(info_hash, SOURCE_SAMPLE, now=float(index))
+            catalog.record_hash(HASH_D, SOURCE_SAMPLE, now=100.0)
+            self.assertEqual(catalog.snapshot_counts()["hashes_seen"], 39)
+            self.assertIsNone(catalog.torrent_detail(HASH_D))
+            self.assertIsNone(catalog.torrent_detail(hashes[0]))
+            self.assertTrue(all(catalog.torrent_detail(info_hash) is not None for info_hash in hashes[1:]))
+        with self.subTest(case="entries with peers are kept"):
+            catalog = TorrentCatalog(max_entries=40)
+            catalog.record_hash(HASH_E, SOURCE_SAMPLE, peer=PEER_1, now=0.0)
+            for index, info_hash in enumerate(numbered_hashes(0xB0, 60)):
+                catalog.record_hash(info_hash, SOURCE_SAMPLE, now=1.0 + index)
+            self.assertIsNotNone(catalog.torrent_detail(HASH_E))
+
+    def test_CATALOG_005_hashes_discovered_counts_created_entries(self):
+        catalog = TorrentCatalog(max_entries=40)
+        hashes = numbered_hashes(0xC0, 100)
+        for index, info_hash in enumerate(hashes):
+            catalog.record_hash(info_hash, SOURCE_SAMPLE, now=float(index))
+        catalog.record_hash(hashes[0], SOURCE_SAMPLE, now=200.0)
+        counts = catalog.snapshot_counts()
+        self.assertEqual((counts["hashes_discovered"], counts["observations"]), (101, 101))
+        self.assertLessEqual(counts["hashes_seen"], 40)
+
+    def test_CATALOG_006_default_capacity(self):
+        self.assertEqual(TorrentCatalog().snapshot_counts()["capacity"], 250000)
 
 
 if __name__ == "__main__":

@@ -3,7 +3,8 @@
 A BitTorrent DHT scraper written in plain Python 3.9 with **no external libraries**. It runs
 several simulated DHT nodes in one process, collects info hashes from the mainline DHT, asks
 nodes for hash samples (BEP 51), downloads torrent **metadata only** from peers (BEP 9 and
-BEP 10) and shows everything in a small web page.
+BEP 10, over TCP, with message stream encryption or uTP when a peer needs it) and shows
+everything in a small web page. The IPv6 DHT (BEP 32) is available with `--ipv6`.
 
 Nothing is written to disk. The catalog lives in memory and disappears when the process ends.
 
@@ -16,23 +17,32 @@ Nothing is written to disk. The catalog lives in memory and disappears when the 
 
 ## What it does
 
-- Runs `--nodes` DHT nodes (default 8) on consecutive UDP ports with one thread and one `select()`.
-- Crawls with `sample_infohashes` (BEP 51), falls back to `find_node` when a node does not support it.
+- Runs `--nodes` DHT nodes (default 8) on consecutive UDP ports, served by one thread and one selector.
+- Crawls with `sample_infohashes` (BEP 51) and falls back to `find_node` when a node does not
+  support it and the crawl queue needs nodes.
 - Answers `ping`, `find_node`, `get_peers`, `announce_peer` and `sample_infohashes` so other
-  nodes keep it in their routing tables and send it hashes.
-- Keeps every hash in a bounded in-memory catalog with counters, peers and a fetch state.
-- Fetches metadata over TCP, most-seen hashes first, with `--fetch-workers` threads (default 32).
-- Finds peers from `announce_peer` senders and from small iterative `get_peers` lookups.
+  nodes keep it in their routing tables and send it hashes. `get_peers` replies carry an id next
+  to the info hash, so clients that look a torrent up announce themselves to us.
+- Keeps every hash in a bounded in-memory catalog (250 000 entries) with counters, peers and a
+  fetch state.
+- Looks up peers with `get_peers`, asking first the node that sampled the hash, one query in
+  flight per lookup, and streams peers to the catalog as they arrive.
+- Downloads metadata with one asyncio loop and up to `--fetch-workers` simultaneous connections
+  (default 256), three peers of a hash at a time, most-seen hashes first.
+- Retries with message stream encryption (RC4) a peer that closes on the plaintext handshake,
+  and tries uTP (BEP 29) on a peer that refuses TCP.
 - Serves a web page with live stats, search and a detail view, and opens it in your browser.
 
-What it deliberately does not do: persist anything, download content, speak IPv6 or uTP,
-encrypt the peer wire, authenticate the web page.
+What it deliberately does not do: persist anything, download content, store DHT items (BEP 44),
+authenticate the web page.
 
 ## Requirements
 
 - Python 3.9 or later. No packages to install.
-- Inbound UDP on the node ports helps a lot (other nodes must be able to reach you), but BEP 51
-  sampling and the lookups work behind NAT too.
+- Inbound UDP on the node ports helps (other nodes must be able to reach you), but BEP 51
+  sampling, the lookups and the fetches work behind NAT too.
+- On Unix the scraper raises its own open file limit to fit the connections (a macOS terminal
+  starts at 256).
 
 ## Quick start
 
@@ -49,6 +59,12 @@ Run for a fixed time without the browser and without metadata fetching:
 python3 -m dht_scraper --duration 60 --no-browser --no-fetch
 ```
 
+Also crawl the IPv6 DHT (more hashes, about 20 % more UDP traffic):
+
+```bash
+python3 -m dht_scraper --ipv6
+```
+
 ## Command line
 
 | Option | Default | Meaning |
@@ -58,16 +74,19 @@ python3 -m dht_scraper --duration 60 --no-browser --no-fetch
 | `--web-host` | 127.0.0.1 | Web page bind address |
 | `--web-port` | 8080 | Web page port (`0` = OS chosen) |
 | `--duration` | none | Seconds to run. Without it, run until Ctrl-C |
-| `--fetch-workers` | 32 | Metadata fetch threads (1 to 256) |
-| `--batch-size` | 5 | Crawl queries per node per interval |
+| `--fetch-workers` | 256 | Simultaneous metadata connections (1 to 1024) |
+| `--batch-size` | 6 | Crawl queries per node per interval |
 | `--interval` | 0.1 | Seconds between crawl batches |
+| `--ipv6` | off | Also run the nodes on the IPv6 DHT (BEP 32), with the same ids |
 | `--log-file` | none | Also write the log to this file |
 | `--verbose` | off | DEBUG logging: every hash, every web request |
 | `--no-fetch` | off | Crawl only |
 | `--no-browser` | off | Do not open the browser |
 
-Default traffic: 8 nodes x 5 queries / 0.1 s = 400 small UDP packets per second (about 40 KB/s
-out) plus the replies. Lower `--nodes` or raise `--interval` on a slow link.
+Default traffic, about 1 000 UDP packets per second out: 8 nodes x 6 queries / 0.1 s = 480 crawl
+queries, at most 420 lookup queries, the replies to other nodes and a few uTP packets; plus at
+most 256 TCP connections. No address receives more than 40 packets in 10 s, below libtorrent's
+ban threshold. Lower `--batch-size` or `--fetch-workers` on a slow link.
 
 ## Architecture
 
@@ -76,7 +95,7 @@ flowchart LR
     subgraph process[dht_scraper process]
         direction LR
         subgraph crawler[crawler thread]
-            S1[(node socket 1)] --- SEL[select]
+            S1[(node socket 1)] --- SEL[selector]
             S2[(node socket 2)] --- SEL
             SN[(node socket N)] --- SEL
             SEL --> H[handle_datagram]
@@ -84,9 +103,10 @@ flowchart LR
             L[LookupManager]
         end
         CAT[(TorrentCatalog<br/>in memory, one lock)]
-        subgraph fetching[scheduler + fetch workers]
-            SCH[FetchScheduler] --> CQ[[candidate queue]] --> W1[fetch worker]
-            CQ --> W2[fetch worker]
+        subgraph fetching[fetch thread: one asyncio loop]
+            FE[FetchEngine] --> J1[job: hash + peers]
+            FE --> J2[job: hash + peers]
+            U[(uTP socket)]
         end
         WEB[web thread<br/>ThreadingHTTPServer]
     end
@@ -94,11 +114,11 @@ flowchart LR
     DHT <--> S2
     DHT <--> SN
     H --> CAT
-    L --> CAT
-    SCH --> CAT
-    W1 -->|"BEP 10 / BEP 9 over TCP"| PEERS((peers))
-    W1 --> CAT
-    W2 --> CAT
+    L -->|"peers as they arrive"| CAT
+    FE --> CAT
+    J1 -->|"BEP 10 / BEP 9 over TCP, MSE or uTP"| PEERS((peers))
+    J2 --> PEERS
+    U --- PEERS
     WEB --> CAT
     BROWSER[browser] <-->|"HTTP JSON"| WEB
 ```
@@ -106,34 +126,32 @@ flowchart LR
 | Thread | Count | Job |
 |---|---|---|
 | main | 1 | starts everything, waits, handles Ctrl-C, stops everything |
-| crawler | 1 | one `select()` over all node sockets, crawl queue, lookups |
-| scheduler | 0 or 1 | re-ranks candidates and fills the bounded queue |
-| fetch-N | `--fetch-workers` | blocking TCP sessions with peers |
+| crawler | 1 | one selector over all node sockets, crawl queues, lookups |
+| fetch | 0 or 1 | one asyncio loop: claims candidates, runs up to `--fetch-workers` connections and 48 uTP connections |
 | web | 1 | serves the page and the JSON API |
 
-Shutdown order: set the stop event, stop the web server, join the scheduler (it drains the
-queue and releases claims), join the workers (in-flight fetches abort within about a second, a
-pending TCP connect within its 5 s timeout), join the crawler, close the sockets, print a final
-summary. If the crawler is still blocked in a slow DNS lookup after its 5 s join timeout, its
-sockets are left open rather than closed under it, and a warning is logged.
+Shutdown order: set the stop event, stop the web server, join the fetch engine (it cancels every
+attempt and releases every claim within about a second), join the crawler, close the sockets,
+print a final summary. If the crawler is still blocked in a slow DNS lookup after its 5 s join
+timeout, its sockets are left open rather than closed under it, and a warning is logged.
 
 ## How the DHT crawl works
 
 ```mermaid
 flowchart TD
-    B[bootstrap: find_node to the routers<br/>from every node] --> Q[node queue]
+    B[bootstrap: find_node to every address of every router<br/>from every node, again every 2 s while the queue is empty] --> Q[node queue]
     Q --> CS[crawl_step: pop batch_size x nodes entries]
     CS -->|"address inside its BEP 51 interval"| FN[send find_node]
     CS -->|"otherwise"| SI[send sample_infohashes]
     FN --> R[responses]
     SI --> R
     R -->|"r.nodes, deduplicated by address"| Q
-    R -->|"r.samples"| CAT[(catalog: record hash, source sample)]
-    R -->|"error 204"| FB[back off sampling this address;<br/>one find_node fallback per address]
+    R -->|"r.samples"| CAT[(catalog: record hash, remember the sampling node)]
+    R -->|"error 204"| FB[back off sampling this address;<br/>one find_node fallback while the queue is less than half full]
     FB --> R
     IN[incoming queries from other nodes] --> PING[ping -> ping response]
     IN --> FNQ[find_node -> recent nodes]
-    IN --> GP[get_peers -> record hash, token]
+    IN --> GP[get_peers -> record hash, token, id next to the hash]
     IN --> AP[announce_peer -> record hash + announced peer]
     IN --> SQ[sample_infohashes -> recent hashes]
     GP --> CAT
@@ -144,9 +162,9 @@ KRPC messages are bencoded dictionaries in UDP datagrams (BEP 5):
 
 | Message | Direction | Fields |
 |---|---|---|
-| `find_node` | out | `id`, `target` -> `nodes` (26 bytes each) |
+| `find_node` | out | `id`, `target` -> `nodes` (26 bytes each), `nodes6` (38 bytes each) on IPv6 |
 | `sample_infohashes` | out | `id`, `target` -> `interval`, `nodes`, `num`, `samples` (20 bytes each) |
-| `get_peers` | out (lookups) and in | `id`, `info_hash` -> `token`, `values` or `nodes` |
+| `get_peers` | out (lookups) and in | `id`, `info_hash` -> `token`, `values` (6 or 18 bytes each) or `nodes` |
 | `announce_peer` | in | `id`, `info_hash`, `port`, `token`, `implied_port` |
 | `ping` | in | `id` |
 | error | in | `[204, "Method Unknown"]` when a node does not support BEP 51 |
@@ -163,7 +181,9 @@ our id:      -------------- copied from the remote id ---------- | -- own 5 byte
 To the remote node we look like one of its closest neighbors, so it keeps us in its routing
 table and sends us `get_peers` and `announce_peer` queries. Each simulated node has its own 5
 byte suffix, so N nodes look like N different neighbors. The crawler never queues a node whose
-suffix matches one of its own, which prevents it from crawling itself.
+suffix matches one of its own, which prevents it from crawling itself. A reply to `get_peers` or
+`announce_peer` copies the first 15 bytes of the *info hash* instead: the client that asked sees
+us as the node closest to the torrent and sends us its `announce_peer`, which is a fresh peer.
 
 ## BEP 51 sampling
 
@@ -174,55 +194,59 @@ sequenceDiagram
     C->>N: sample_infohashes {id: neighbor id, target: random}
     alt node supports BEP 51
         N-->>C: {interval, nodes, num, samples}
-        Note over C: record each 20-byte sample<br/>queue the nodes<br/>do not sample this address again before interval
+        Note over C: record each 20-byte sample<br/>remember N as the hint node of each sample<br/>queue the nodes<br/>do not sample this address again before interval
+        C->>N: get_peers for a sampled hash (from the same node socket)
+        N-->>C: {values} when it still stores peers for it
     else node does not support it
         N-->>C: error [204, "Method Unknown"]
         Note over C: stop sampling this address for a while
-        C->>N: find_node (once per address)
+        C->>N: find_node (once per address, while the queue needs nodes)
         N-->>C: {nodes}
     end
 ```
 
 Sampling is active: the first responses already carry up to about 20 hashes each. The neighbor
 id trick is passive: it needs minutes before other nodes start announcing to us. Both run at the
-same time.
+same time. A sampled hash comes from the sampling node's own peer storage, so the lookup asks
+that node first; libtorrent keeps its sample for up to 6 hours while peers expire after about
+45 minutes, so about a third of these first answers carry peers and the others lead to closer nodes.
 
 ## The in-memory catalog
 
 Per hash: `seen_count`, `announce_count`, `first_seen`, `last_seen`, up to 32 candidate peers,
-fetch state, attempts, retry time, lookup state, and the metadata once fetched.
+the peers that already failed, fetch state, attempts, lookup state, and the metadata once fetched.
 
 ```mermaid
 stateDiagram-v2
     [*] --> pending: first sighting
-    pending --> in_progress: claimed by the scheduler (has peers, backoff passed)
+    pending --> in_progress: claimed by the fetch engine (has peers)
     in_progress --> done: metadata stored (SHA-1 verified)
-    in_progress --> pending: fetch failed, attempts < 3 (retry after 60 s x attempts)
-    in_progress --> failed: fetch failed, attempts = 3
+    in_progress --> pending: every peer failed, untried peers or lookups left (at once)
+    in_progress --> failed: 3 attempts, or no peer and no lookup left
     pending --> failed: 2 lookups found no peers
-    in_progress --> failed: fetch failed, no peers left, lookups exhausted
     done --> [*]
     failed --> [*]
 ```
 
-Capacity is 50 000 entries. When full, the 5 % least valuable entries are evicted: entries
-without metadata first, then the lowest seen count, then the oldest. Entries that are in
-progress are never evicted. Ranking is recomputed from live counters on every scheduling round,
-so there is no priority heap that can go stale.
+Capacity is 250 000 entries. When full, 5 % are evicted: first the oldest entries seen once
+without metadata and without peers, then the lowest `(metadata, peers, seen count, last seen)`.
+Entries that are in progress or being looked up are never evicted. Fetch candidates are ranked
+by `(seen_count, last_seen)` on every call; lookups take the most recently observed hashes first.
+A peer that failed for a hash is never added back to it.
 
 ## Metadata download (BEP 10 + BEP 9)
 
 ```mermaid
 sequenceDiagram
-    participant W as fetch worker
+    participant W as fetch engine
     participant P as peer (TCP)
-    W->>P: handshake: 19 "BitTorrent protocol", reserved[5] |= 0x10, info_hash, peer_id
-    P-->>W: handshake (must carry the same info_hash and the extension bit)
-    W->>P: extended handshake {m: {ut_metadata: 1}}
+    W->>P: handshake (reserved[5] |= 0x10) + extended handshake {m: {ut_metadata: 1}}, one write
+    P-->>W: handshake (same info_hash, extension bit)
     P-->>W: extended handshake {m: {ut_metadata: n}, metadata_size}
-    loop for each 16 KiB piece
-        W->>P: ut_metadata {msg_type: 0, piece: i}
+    W->>P: ut_metadata requests for pieces 0..7 (window of 8)
+    loop until every 16 KiB piece arrived
         P-->>W: ut_metadata {msg_type: 1, piece: i, total_size} + raw bytes
+        W->>P: next request while pieces remain
     end
     Note over W: sha1(all pieces) == info_hash ?<br/>decode the info dict: name, files, piece length
 ```
@@ -231,33 +255,50 @@ Wire format of one peer wire frame: `uint32 length`, `uint8 message id`, body. E
 messages have id 20, then one byte for the extension id, then a bencoded dictionary, then raw
 bytes for `ut_metadata` data messages.
 
-Failure reasons (each one ends the session and moves on to the next peer): `connect`, `closed`,
-`timeout`, `bad_handshake`, `hash_mismatch`, `no_extensions`, `no_ut_metadata`, `too_large`
-(over 4 MiB), `reject`, `bad_piece`, `sha1_mismatch`, `frame_too_large` (over 1 MiB).
+Timeouts: connect 1 s (measured: 95 % of successful connects take less than 311 ms), handshake 4 s,
+each piece 5 s, whole session 15 s. Failure reasons: `connect_timeout`, `connect` (refused),
+`closed_on_handshake`, `closed`, `timeout`, `bad_handshake`, `hash_mismatch`, `no_extensions`,
+`no_ut_metadata`, `too_large` (over 4 MiB), `reject`, `bad_piece`, `sha1_mismatch`,
+`frame_too_large` (over 1 MiB), `encryption_failed`, `bad_info_dict`, `local_error` (our side ran
+out of descriptors or ports: nobody is blamed), `skipped_unreachable` (the address timed out or
+refused within the last 10 minutes, not tried again).
 
-The worker never sends `interested` or `request`, so a peer cannot push content, and any `piece`
+**Message stream encryption.** A peer that closes before sending one handshake byte may require
+encryption. It is retried once, on the same connection slot, with MSE: Diffie-Hellman over the
+768-bit prime, `SHA1("req1", S)` and the obfuscated info hash, then RC4 keyed with
+`SHA1("keyA" or "keyB", S, info hash)` after dropping 1 024 bytes, with our two handshakes in the
+initial payload. The peer may pick RC4 or plaintext for the rest of the session.
+
+**uTP.** A peer that refuses the TCP connection is tried over uTP (BEP 29) when one of 48 uTP
+slots is free: one UDP socket multiplexes the connections by connection id; SYN and data are
+resent after 1 s (doubling, 4 times); out-of-order packets wait in a buffer; every data packet is
+acknowledged with the measured one-way delay.
+
+The client never sends `interested` or `request`, so a peer cannot push content, and any `piece`
 frame that arrives anyway is discarded.
 
-## Fetch scheduling
+## Peer lookups and the fetch engine
 
 ```mermaid
 flowchart TD
-    A[scheduler: free slots in the queue?] -->|no| Z[wait 0.5 s]
-    A -->|yes| B[catalog.next_fetch_candidates: pending, has peers, backoff passed<br/>ranked by seen_count then last_seen]
-    B --> C[entries become in_progress]
-    C --> D[[candidate queue, size = workers]]
-    D --> E[worker: try up to 4 peers, newest announced first]
-    E -->|verified| F[store_metadata -> done]
-    E -->|all failed| G[mark_fetch_failed: drop tried peers,<br/>pending with backoff or failed]
-    G -->|no peers left| H[eligible for a get_peers lookup]
+    A[crawler step, every 0.1 s] -->|"fetchable backlog < 512 and query tokens left"| B[catalog: newest hashes needing peers]
+    B --> C[lookup: hint node first, then the closest unqueried node, one query in flight]
+    C -->|"values"| D[catalog.add_peers: fetchable at once]
+    C -->|"8 peers, 2 value answers, 16 queries, 6 s or nothing left"| E[catalog.add_lookup_result]
+    D --> F[fetch engine: claim while connection slots are free]
+    F --> G[job: newest peer first, 3 at a time, 0.3 s stagger]
+    G -->|"verified metadata"| H[store_metadata -> done, other attempts cancelled]
+    G -->|"every peer failed"| I[mark_fetch_failed: failed peers never come back]
+    I -->|"untried peers left"| F
+    I -->|"no peer left"| B
 ```
 
-Peers come from two sources. `announce_peer` senders are recorded with their announced port.
-Hashes without peers get an iterative `get_peers` lookup: up to 4 rounds of 8 queries to the
-closest known nodes, finished as soon as one node returns `values`, with a deadline of 8 s. A
-reply is only accepted from the address that was actually queried. At most 16 lookups run at a
-time, all inside the crawler thread without blocking it. A hash whose lookups are exhausted and
-whose peers all failed to answer moves to `failed` rather than sitting in `pending` forever.
+Peers come from `announce_peer` senders and from `get_peers` lookups. A lookup keeps one query in
+flight (measured: 1.12 peers found per query, against 0.58 with four queries in flight), accepts
+a reply only from the address it asked, and pushes peers to the catalog as soon as a `values`
+answer arrives. All lookups share a budget of 420 queries per second, at most 256 run at once, and
+at most 4 queries are in flight to the same node. The fetch engine claims candidates only while
+connection slots are free, so the ranking is always recomputed on fresh counters.
 
 ## Web page
 
@@ -297,20 +338,52 @@ never inject HTML. The page is served with a strict Content-Security-Policy.
 
 ## Logging
 
-Format: `time LEVEL [thread] message`. INFO shows start, bootstrap, a summary every 10 s, each
-stored metadata record, web page actions and shutdown. `--verbose` adds every hash seen through
-`get_peers` and `announce_peer`, lookup progress and the stats polling. `--log-file` duplicates
-the log to a file.
+Format: `time LEVEL [thread] message`. INFO shows start, bootstrap, a summary every 10 s (packets,
+samples, hashes, discovered hashes, metadata, fetch attempts, open connections, crawl queue,
+lookups), each stored metadata record, web page actions and shutdown. `--verbose` adds every hash
+seen through `get_peers` and `announce_peer`, lookup progress, failed fetches and the stats
+polling. `--log-file` duplicates the log to a file.
+
+## Performance
+
+Measured on 2026-09-24 on a home fibre line (IPv4 behind NAT, Apple M4), 60 s runs of
+`python3 -m dht_scraper --duration 60 --no-browser` with default settings, before and after runs
+alternating with pauses in between. Counters are read at the deadline; unique hashes are counted
+outside the catalog, so its capacity does not cap them.
+
+| Metric, 60 s | Before: 6 runs, median [range] | After: 3 runs, median [range] |
+|---|---|---|
+| Unique info hashes found | 151 711 [67 501 - 188 067] | 218 770 [217 640 - 233 171] |
+| Metadata downloaded and SHA-1 verified | 15 [7 - 20] | 825 [797 - 846] |
+| Peer connection attempts | 371 [140 - 475] | 13 080 [12 766 - 13 687] |
+| Attempts that end with metadata | 4.2 % [3.0 - 6.2] | 6.3 % [5.8 - 6.6] |
+| `get_peers` lookups started | 413 [159 - 507] | 3 980 [3 965 - 4 044] |
+| `sample_infohashes` queries sent | 19 518 [9 648 - 23 324] | 27 864 [27 829 - 27 973] |
+| UDP packets sent per second | 451 [220 - 544] | 1 013 [1 011 - 1 041] |
+| Peer connections at once | 32 threads | 256 |
+| CPU (share of one core) | 18 % | 44 % |
+| Peak memory | 105 MB | 201 MB |
+
+The old bootstrap cached one address per router and three of its four routers no longer answer:
+in three of the six "before" runs it lost 10 to 20 s before the first sample, hence its wide
+range. Where the metadata gain comes from, in measured steps: many simultaneous connections with a
+1 s connect timeout (the old 32 threads spent 77 % of their time waiting for dead peers), lookups
+that ask the sampling node first and keep one query in flight, peers streamed to the catalog,
+immediate retries on untried peers, and a cache of unreachable addresses. `--ipv6` adds about 30 %
+more hashes for about 20 % more traffic.
 
 ## Limitations
 
 - Inbound UDP is needed for the passive path (other nodes announcing to us).
-- IPv4 only.
-- Everything is lost on exit, and the catalog is capped at 50 000 hashes.
+- Everything is lost on exit, and the catalog is capped at 250 000 hashes.
 - `seen_count` is a rough popularity signal, not a swarm size.
-- Many peers refuse metadata (no extension support, choked, wrong torrent). Expect a low
-  success ratio per peer; the scheduler compensates by trying popular hashes first.
+- Most peers cannot be reached: about 60 % of TCP connects time out (NAT, firewall, offline) and
+  15 % are refused. About 6 % of connection attempts end with verified metadata.
 - Only nodes that implement BEP 51 answer sampling; the rest are crawled with `find_node`.
+- IPv6 is off by default: within the same traffic budget it found as many hashes and fewer
+  metadata than IPv4 alone. With `--ipv6` the hashes grow by about 30 % for about 20 % more traffic.
+- uTP is only used after a TCP refusal and with a small budget; MSE only after a close on the
+  plaintext handshake. Each adds about 1 to 3 % of downloads.
 
 ## Tests
 
@@ -325,8 +398,9 @@ the log to a file.
 | runtime | `python3 -m unittest discover -s tests/runtime -t .` |
 | cli | `python3 -m unittest discover -s tests/cli -t .` |
 
-All tests run offline with fake sockets, loopback sockets on port 0 and a fake `ut_metadata`
-peer.
+All tests run offline with fake sockets, loopback sockets on port 0 (IPv4 and `::1`), and fake
+peers for TCP, MSE and uTP. Test methods carry the ID of the spec they check, for example
+`test_LOOKUP_001_...`.
 
 ## Code layout
 
@@ -334,21 +408,23 @@ peer.
 |---|---|
 | `bencode_codec.py` | bencode encode and decode |
 | `node_identity.py` | node ids, neighbor ids, XOR distance, transaction and peer ids |
-| `krpc_messages.py` | KRPC builders and decoders, compact nodes and peers |
-| `dht_node_sockets.py` | N UDP sockets, one id each |
-| `dht_crawler.py` | crawler thread: select loop, BEP 51 crawl, query answering |
-| `dht_lookup.py` | iterative `get_peers` lookups |
+| `krpc_messages.py` | KRPC builders and decoders, compact nodes and peers (IPv4 and IPv6), address filter |
+| `dht_node_sockets.py` | N UDP sockets per family, one id each |
+| `dht_crawler.py` | crawler thread: selector loop, BEP 51 crawl, query answering, per-address cap |
+| `dht_lookup.py` | continuous `get_peers` lookups with hint nodes and a query budget |
 | `peer_wire_messages.py` | handshake, frames, extension protocol, `ut_metadata` |
-| `metadata_fetcher.py` | one TCP session with a peer |
+| `metadata_fetcher.py` | one metadata session with a peer over any byte stream, TCP connect |
+| `stream_encryption.py` | message stream encryption: Diffie-Hellman, RC4, negotiation |
+| `utp_transport.py` | uTP client on one UDP socket |
+| `fetch_engine.py` | the fetch thread: asyncio loop, connection slots, jobs, reachability cache |
 | `torrent_info_summary.py` | info dict to a small metadata record |
 | `torrent_catalog.py` | bounded in-memory catalog, ranking, fetch and lookup state, search |
-| `fetch_scheduler.py`, `fetch_worker_pool.py` | scheduling and worker threads |
 | `bounded_recent_map.py` | insertion-ordered mapping with a size cap |
 | `magnet_link.py`, `web_page.py`, `web_interface.py` | magnet links, the page, the HTTP API |
 | `scraper_runtime.py` | thread wiring, stats, browser launch, shutdown |
 | `__main__.py` | command line |
 
-The specification lives in `spec/`.
+The specification lives in `spec/`, indexed by `spec/README.md`.
 
 ## License
 

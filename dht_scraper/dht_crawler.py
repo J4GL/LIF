@@ -1,9 +1,9 @@
-"""DHT crawler thread: N simulated nodes share one select loop, crawl with BEP 51 and answer queries."""
+"""DHT crawler thread: N simulated nodes per address family share one selector loop, crawl with BEP 51, answer queries."""
 import collections
 import itertools
 import logging
 import os
-import select
+import selectors
 import socket
 import threading
 import time
@@ -11,13 +11,15 @@ from typing import Any, Callable, Deque, Dict, List, Optional, Sequence, Tuple
 
 from dht_scraper.bencode_codec import decode_bencode, encode_bencode, is_plain_int
 from dht_scraper.bounded_recent_map import remember
-from dht_scraper.dht_lookup import LookupManager
+from dht_scraper.dht_lookup import DEFAULT_LOOKUP_LIMITS, LookupLimits, LookupManager
 from dht_scraper.dht_node_sockets import NodeSocket, own_id_suffixes
 from dht_scraper.event_log import LOGGER_NAME
 from dht_scraper.krpc_messages import (
     ERROR_METHOD_UNKNOWN,
     ERROR_PROTOCOL,
     MAX_SAMPLE_INTERVAL,
+    NODES6_KEY,
+    NODES_KEY,
     QUERY_SAMPLE_INFOHASHES,
     Address,
     Message,
@@ -31,6 +33,7 @@ from dht_scraper.krpc_messages import (
     build_sample_infohashes_query,
     build_sample_infohashes_response,
     decode_compact_nodes,
+    decode_compact_nodes6,
     decode_samples,
     encode_compact_nodes,
     is_routable_address,
@@ -57,24 +60,84 @@ DEFAULT_BOOTSTRAP_NODES: List[Tuple[str, int]] = [
     ("dht.transmissionbt.com", 6881),
     ("router.utorrent.com", 6881),
     ("dht.aelitis.com", 6881),
+    ("dht.libtorrent.org", 25401),
 ]
 MAX_DATAGRAM_SIZE = 65535
 RECENT_NODES_SIZE = 8
 RECENT_HASHES_SIZE = 64
 SAMPLES_PER_RESPONSE = 20
 OWN_SAMPLE_INTERVAL = 300
-BOOTSTRAP_RETRY_SECONDS = 5.0
-LOOKUP_SCAN_INTERVAL_SECONDS = 1.0
+BOOTSTRAP_RETRY_SECONDS = 2.0
 MAX_RECEIVE_PER_SOCKET = 1000
 MAX_BACKOFF_ENTRIES = 50000
 TOKEN_SECRET_LENGTH = 16
 LOOKUP_SEED_SCAN = 2000
 LOOKUP_SEED_COUNT = 16
+LOOKUP_FETCHABLE_TARGET = 512
+HINT_NODES_SIZE = 65536
+SOCKET_AFFINITY_SIZE = 65536
+PER_ADDRESS_WINDOW_SECONDS = 10.0
+PER_ADDRESS_MAX_PACKETS = 40
+SEND_WINDOW_ENTRIES = 65536
 COUNTER_KEYS = (
     "packets_sent", "packets_received", "queries_received", "responses_received", "errors_received",
-    "samples_received", "announced_peers", "lookups_started", "sample_queries_sent", "find_node_sent",
+    "samples_received", "sample_responses", "announced_peers", "lookups_started", "sample_queries_sent", "find_node_sent",
+    "packets_throttled",
 )
-STATS_KEYS = COUNTER_KEYS + ("queue_size", "active_lookups")
+LOOKUP_KEYS = (
+    "lookups_finished", "lookups_with_peers", "lookup_peers_found", "lookup_queries_sent",
+    "lookup_hint_queries", "lookup_hint_answers", "lookup_hint_values", "active_lookups",
+)
+STATS_KEYS = COUNTER_KEYS + LOOKUP_KEYS + ("queue_size", "queue_size6")
+
+
+# Parents: DhtCrawler.run
+# Keywords: pacing, interval, drift, catch up
+def next_batch_time(due: float, now: float, interval: float) -> float:
+    assert interval > 0 and now >= due
+    result = due + interval
+    if now - due > interval:
+        result = now + interval
+    assert result > now - interval
+    return result
+
+
+# Parents: DhtCrawler.bootstrap (default resolver)
+# Keywords: dns, every address, ipv4, ipv6, getaddrinfo
+def resolve_addresses(host: str, port: int, family: int) -> List[str]:
+    assert host and 0 < port <= 65535 and family in (socket.AF_INET, socket.AF_INET6)
+    infos = socket.getaddrinfo(host, port, family, socket.SOCK_DGRAM)
+    result = sorted({info[4][0] for info in infos})
+    assert all(isinstance(ip, str) for ip in result)
+    return result
+
+
+# Parents: DhtCrawler (every family dispatch)
+# Keywords: address family, ipv6, colon
+def address_family(ip: str) -> int:
+    assert isinstance(ip, str)
+    result = socket.AF_INET6 if ":" in ip else socket.AF_INET
+    assert result in (socket.AF_INET, socket.AF_INET6)
+    return result
+
+
+class FamilyState:
+    """Crawl queue, recent nodes and socket rotation of one address family."""
+
+    __slots__ = ("family", "node_sockets", "socket_cycle", "node_queue", "recent_nodes", "nodes_key", "last_bootstrap_time")
+
+    # Parents: DhtCrawler.__init__
+    # Keywords: family, queue, recent nodes, rotation
+    def __init__(self, family: int, node_sockets: List[NodeSocket], max_queue: int) -> None:
+        assert node_sockets and all(node.family == family for node in node_sockets)
+        self.family = family
+        self.node_sockets = node_sockets
+        self.socket_cycle = itertools.cycle(node_sockets)
+        self.node_queue: Deque[Node] = collections.deque(maxlen=max_queue)
+        self.recent_nodes: Deque[Node] = collections.deque(maxlen=RECENT_NODES_SIZE)
+        self.nodes_key = NODES6_KEY if family == socket.AF_INET6 else NODES_KEY
+        self.last_bootstrap_time = float("-inf")
+        assert not self.node_queue
 
 
 class DhtCrawler:
@@ -95,46 +158,62 @@ class DhtCrawler:
         interval: float = 0.1,
         max_queue: int = 20000,
         clock: Callable[[], float] = time.monotonic,
+        lookup_fetchable_target: int = LOOKUP_FETCHABLE_TARGET,
+        lookup_limits: LookupLimits = DEFAULT_LOOKUP_LIMITS,
+        resolver: Callable[[str, int, int], List[str]] = resolve_addresses,
     ) -> None:
-        assert len(node_sockets) >= 1 and batch_size >= 1 and interval > 0 and max_queue >= 1
+        assert len(node_sockets) >= 1 and batch_size >= 1 and interval > 0 and max_queue >= 1 and lookup_fetchable_target >= 0
         assert len(bootstrap_nodes) > 0, "bootstrap list must not be empty"
         self.node_sockets = list(node_sockets)
-        self.socket_index = {id(node.udp_socket): node for node in self.node_sockets}
+        self.selector: Optional[selectors.BaseSelector] = None
         self.catalog = catalog
         self.bootstrap_nodes = list(bootstrap_nodes)
-        self.resolved_bootstrap_hosts: Dict[str, str] = {}
+        self.resolver = resolver
+        self.resolved_bootstrap_hosts: Dict[int, Dict[str, List[str]]] = {}
         self.batch_size = batch_size
         self.interval = interval
         self.clock = clock
         self.own_suffixes = own_id_suffixes(self.node_sockets)
-        self.socket_cycle = itertools.cycle(self.node_sockets)
+        self.families: Dict[int, FamilyState] = {}
+        for family in (socket.AF_INET, socket.AF_INET6):
+            members = [node for node in self.node_sockets if node.family == family]
+            if members:
+                self.families[family] = FamilyState(family, members, max_queue)
+                self.resolved_bootstrap_hosts[family] = {}
+        primary = next(iter(self.families.values()))
+        self.node_queue = primary.node_queue
+        self.recent_nodes = primary.recent_nodes
         self.token_secret = os.urandom(TOKEN_SECRET_LENGTH)
-        self.node_queue: Deque[Node] = collections.deque(maxlen=max_queue)
-        self.recent_nodes: Deque[Node] = collections.deque(maxlen=RECENT_NODES_SIZE)
         self.recent_hashes: Deque[bytes] = collections.deque(maxlen=RECENT_HASHES_SIZE)
         self.sample_backoff: "collections.OrderedDict[Address, float]" = collections.OrderedDict()
         self.fallback_sent: "collections.OrderedDict[Address, None]" = collections.OrderedDict()
         self.recently_queued: "collections.OrderedDict[Address, None]" = collections.OrderedDict()
+        self.hint_nodes: "collections.OrderedDict[bytes, Node]" = collections.OrderedDict()
+        self.socket_affinity: "collections.OrderedDict[Address, NodeSocket]" = collections.OrderedDict()
+        self.send_windows: "collections.OrderedDict[str, Tuple[float, int]]" = collections.OrderedDict()
+        self.lookup_fetchable_target = lookup_fetchable_target
         self.stats: Dict[str, int] = {key: 0 for key in COUNTER_KEYS}
-        self.lookup_manager = LookupManager(self.send_lookup_query, catalog.add_lookup_result, clock, self.is_foreign_node)
-        self.last_bootstrap_time = float("-inf")
-        self.next_lookup_scan = float("-inf")
-        assert len(self.socket_index) == len(self.node_sockets) and len(self.node_queue) == 0
+        self.lookup_manager = LookupManager(self.send_lookup_query, catalog.add_lookup_result, clock, self.is_foreign_node, catalog.add_peers, lookup_limits)
+        assert len(self.node_queue) == 0 and self.families
 
     # Parents: send_crawl_query, send_lookup_query
-    # Keywords: round robin, socket, virtual node
-    def pick_node_socket(self) -> NodeSocket:
-        assert len(self.node_sockets) >= 1
-        result = next(self.socket_cycle)
-        assert result in self.node_sockets
+    # Keywords: round robin, socket, virtual node, family
+    def pick_node_socket(self, family: int = socket.AF_INET) -> Optional[NodeSocket]:
+        assert family in (socket.AF_INET, socket.AF_INET6)
+        state = self.families.get(family)
+        result = next(state.socket_cycle) if state is not None else None
+        assert result is None or result.family == family
         return result
 
     # Parents: send_find_node, send_sample_infohashes, send_lookup_query, handle_query, handle_ping_query,
     #          handle_find_node_query, handle_get_peers_query, handle_announce_peer_query,
     #          handle_sample_infohashes_query, read_info_hash, handle_error
-    # Keywords: udp, send, bencode, datagram
+    # Keywords: udp, send, bencode, datagram, per address cap
     def send_message(self, node_socket: NodeSocket, message: Message, address: Address) -> bool:
         assert isinstance(message, dict) and node_socket in self.node_sockets
+        if not self.allow_send(address[0]):
+            self.stats["packets_throttled"] += 1
+            return False
         payload = encode_bencode(message)
         try:
             node_socket.udp_socket.sendto(payload, address)
@@ -143,6 +222,21 @@ class DhtCrawler:
             return False
         self.stats["packets_sent"] += 1
         assert self.stats["packets_sent"] >= 1
+        return True
+
+    # Parents: send_message
+    # Keywords: rate limit, per address, ban avoidance, window
+    def allow_send(self, ip: str) -> bool:
+        assert isinstance(ip, str)
+        now = self.clock()
+        window = self.send_windows.get(ip)
+        if window is None or now - window[0] >= PER_ADDRESS_WINDOW_SECONDS:
+            remember(self.send_windows, ip, (now, 1), SEND_WINDOW_ENTRIES)
+            return True
+        if window[1] >= PER_ADDRESS_MAX_PACKETS:
+            return False
+        self.send_windows[ip] = (window[0], window[1] + 1)
+        assert self.send_windows[ip][1] <= PER_ADDRESS_MAX_PACKETS
         return True
 
     # Parents: bootstrap, send_crawl_query, handle_error
@@ -169,7 +263,9 @@ class DhtCrawler:
     # Keywords: crawl policy, backoff, bep51 primary, find_node fallback
     def send_crawl_query(self, node: Node) -> None:
         assert len(node) == 3
-        node_socket = self.pick_node_socket()
+        node_socket = self.pick_node_socket(address_family(node[1]))
+        if node_socket is None:
+            return
         address = (node[1], node[2])
         backoff_until = self.sample_backoff.get(address)
         if backoff_until is not None and backoff_until > self.clock():
@@ -178,41 +274,50 @@ class DhtCrawler:
             self.send_sample_infohashes(node_socket, node)
         assert self.stats["packets_sent"] >= 0
 
-    # Parents: LookupManager.send_round
-    # Keywords: get_peers, lookup, query, neighbor id
+    # Parents: LookupManager.send_to
+    # Keywords: get_peers, lookup, query, neighbor id, socket affinity
     def send_lookup_query(self, transaction_id: bytes, node: Node, info_hash: bytes) -> None:
         assert len(transaction_id) == LOOKUP_TRANSACTION_ID_LENGTH and len(info_hash) == NODE_ID_LENGTH
-        node_socket = self.pick_node_socket()
+        node_socket = self.socket_affinity.get((node[1], node[2])) or self.pick_node_socket(address_family(node[1]))
+        if node_socket is None:
+            return
         query = build_get_peers_query(transaction_id, neighbor_node_id(node[0], node_socket.own_id), info_hash)
         self.send_message(node_socket, query, (node[1], node[2]))
         assert query[b"q"] == b"get_peers"
 
     # Parents: run, crawl_step
-    # Keywords: bootstrap, dns, router, join
-    def bootstrap(self) -> None:
+    # Keywords: bootstrap, dns, router, every address, join, every family
+    def bootstrap(self, families: Optional[Sequence[int]] = None) -> None:
         assert len(self.bootstrap_nodes) > 0
-        self.last_bootstrap_time = self.clock()
-        for host, port in self.bootstrap_nodes:
-            if host not in self.resolved_bootstrap_hosts:
-                try:
-                    self.resolved_bootstrap_hosts[host] = socket.gethostbyname(host)
-                except OSError as error:
-                    LOGGER.warning("bootstrap: cannot resolve %s: %s", host, error)
-                    continue
-            ip = self.resolved_bootstrap_hosts[host]
-            for node_socket in self.node_sockets:
-                self.send_find_node(node_socket, (node_socket.own_id, ip, port))
-        LOGGER.info("bootstrap: contacted %d of %d routers from %d nodes", len(self.resolved_bootstrap_hosts), len(self.bootstrap_nodes), len(self.node_sockets))
-        assert self.last_bootstrap_time > float("-inf")
+        for family in families if families is not None else list(self.families):
+            state = self.families[family]
+            state.last_bootstrap_time = self.clock()
+            resolved = self.resolved_bootstrap_hosts[family]
+            retry_failed = not any(resolved.values())
+            contacted = 0
+            for host, port in self.bootstrap_nodes:
+                if host not in resolved or (retry_failed and not resolved[host]):
+                    try:
+                        resolved[host] = self.resolver(host, port, family)
+                    except OSError as error:
+                        LOGGER.debug("bootstrap: cannot resolve %s for family %d: %s", host, family, error)
+                        resolved[host] = []
+                for ip in resolved[host]:
+                    contacted += 1
+                    for node_socket in state.node_sockets:
+                        self.send_find_node(node_socket, (node_socket.own_id, ip, port))
+            LOGGER.info("bootstrap: contacted %d %s router addresses of %d hosts from %d nodes", contacted, "IPv6" if family == socket.AF_INET6 else "IPv4", len(self.bootstrap_nodes), len(state.node_sockets))
+        assert all(state.last_bootstrap_time > float("-inf") for state in self.families.values() if families is None)
 
     # Parents: add_node, handle_response, LookupManager.add_to_shortlist
-    # Keywords: node filter, self reference, routable, admission
+    # Keywords: node filter, self reference, routable, admission, family with sockets
     def is_foreign_node(self, node: Node) -> bool:
         node_id, ip, port = node
         assert isinstance(ip, str)
         result = (
             is_valid_node_id(node_id)
             and node_id[NEIGHBOR_PREFIX_LENGTH:] not in self.own_suffixes
+            and address_family(ip) in self.families
             and is_routable_address(ip, port)
         )
         assert isinstance(result, bool)
@@ -222,17 +327,19 @@ class DhtCrawler:
     # Keywords: queue, node, filter, dedup
     def add_node(self, node: Node) -> None:
         assert len(node) == 3
-        if not self.is_foreign_node(node) or not remember(self.recently_queued, (node[1], node[2]), None, MAX_BACKOFF_ENTRIES):
+        state = self.families.get(address_family(node[1])) if isinstance(node[1], str) else None
+        if state is None or not self.is_foreign_node(node) or not remember(self.recently_queued, (node[1], node[2]), None, MAX_BACKOFF_ENTRIES):
             return
-        self.node_queue.append(node)
-        self.recent_nodes.append(node)
-        assert len(self.node_queue) <= (self.node_queue.maxlen or 0)
+        state.node_queue.append(node)
+        state.recent_nodes.append(node)
+        assert len(state.node_queue) <= (state.node_queue.maxlen or 0)
 
     # Parents: receive_pending, tests
     # Keywords: datagram, dispatch, decode, krpc
     def handle_datagram(self, data: bytes, address: Address, node_socket: NodeSocket) -> None:
         assert isinstance(data, bytes) and node_socket in self.node_sockets
         self.stats["packets_received"] += 1
+        remember(self.socket_affinity, address, node_socket, SOCKET_AFFINITY_SIZE)
         try:
             message = decode_bencode(data)
         except (ValueError, RecursionError) as error:
@@ -261,24 +368,31 @@ class DhtCrawler:
             return
         if not isinstance(response, dict):
             return
-        sender = (response.get(b"id"), address[0], address[1])
+        sender: Optional[Node] = (response.get(b"id"), address[0], address[1])
         if self.is_foreign_node(sender):
-            self.recent_nodes.append(sender)
-        compact_nodes = response.get(b"nodes")
-        if isinstance(compact_nodes, bytes):
-            for node in decode_compact_nodes(compact_nodes):
-                self.add_node(node)
+            self.families[address_family(address[0])].recent_nodes.append(sender)
+        else:
+            sender = None
+        for key, decoder in ((NODES_KEY, decode_compact_nodes), (NODES6_KEY, decode_compact_nodes6)):
+            compact_nodes = response.get(key)
+            if isinstance(compact_nodes, bytes):
+                for node in decoder(compact_nodes):
+                    self.add_node(node)
         if b"samples" in response:
-            self.handle_samples(response, address)
+            self.handle_samples(response, address, sender)
         assert self.stats["responses_received"] >= 1
 
     # Parents: handle_response
-    # Keywords: samples, bep51, record, interval backoff
-    def handle_samples(self, response: Dict[bytes, Any], address: Address) -> None:
+    # Keywords: samples, bep51, record, interval backoff, hint nodes
+    def handle_samples(self, response: Dict[bytes, Any], address: Address, sender: Optional[Node]) -> None:
         assert isinstance(response, dict)
         samples = decode_samples(response.get(b"samples"))
         self.catalog.record_hashes(samples, SOURCE_SAMPLE)
         self.recent_hashes.extend(samples)
+        if sender is not None:
+            for info_hash in samples:
+                remember(self.hint_nodes, info_hash, sender, HINT_NODES_SIZE)
+        self.stats["sample_responses"] += 1
         interval = response.get(b"interval")
         seconds = interval if is_plain_int(interval) else 0
         remember(self.sample_backoff, address, self.clock() + max(0, min(seconds, MAX_SAMPLE_INTERVAL)), MAX_BACKOFF_ENTRIES)
@@ -296,7 +410,9 @@ class DhtCrawler:
             return
         if read_error_code(message) == ERROR_METHOD_UNKNOWN:
             remember(self.sample_backoff, address, self.clock() + MAX_SAMPLE_INTERVAL, MAX_BACKOFF_ENTRIES)
-            if remember(self.fallback_sent, address, None, MAX_BACKOFF_ENTRIES):
+            queue = self.families[node_socket.family].node_queue
+            needs_nodes = len(queue) * 2 < (queue.maxlen or 0)
+            if needs_nodes and remember(self.fallback_sent, address, None, MAX_BACKOFF_ENTRIES):
                 self.send_find_node(node_socket, (node_socket.own_id, address[0], address[1]))
         assert self.stats["errors_received"] >= 1
 
@@ -312,6 +428,8 @@ class DhtCrawler:
             return
         sender_id = args.get(b"id")
         reply_id = neighbor_node_id(sender_id, node_socket.own_id) if is_valid_node_id(sender_id) else node_socket.own_id
+        if query_name in (b"get_peers", b"announce_peer") and is_valid_node_id(args.get(b"info_hash")):
+            reply_id = neighbor_node_id(args[b"info_hash"], node_socket.own_id)
         if query_name == b"ping":
             self.handle_ping_query(transaction_id, reply_id, address, node_socket)
         elif query_name == b"find_node":
@@ -338,7 +456,8 @@ class DhtCrawler:
     # Keywords: find_node, response, recent nodes
     def handle_find_node_query(self, transaction_id: bytes, reply_id: bytes, address: Address, node_socket: NodeSocket) -> None:
         assert len(reply_id) == NODE_ID_LENGTH
-        sent = self.send_message(node_socket, build_find_node_response(transaction_id, reply_id, encode_compact_nodes(self.recent_nodes)), address)
+        state = self.families[node_socket.family]
+        sent = self.send_message(node_socket, build_find_node_response(transaction_id, reply_id, encode_compact_nodes(state.recent_nodes), state.nodes_key), address)
         assert isinstance(sent, bool)
 
     # Parents: handle_get_peers_query, handle_announce_peer_query
@@ -361,7 +480,8 @@ class DhtCrawler:
             return
         self.record_hash(info_hash, SOURCE_GET_PEERS)
         token = make_token(self.token_secret, address[0])
-        sent = self.send_message(node_socket, build_get_peers_response(transaction_id, reply_id, token, encode_compact_nodes(self.recent_nodes)), address)
+        state = self.families[node_socket.family]
+        sent = self.send_message(node_socket, build_get_peers_response(transaction_id, reply_id, token, encode_compact_nodes(state.recent_nodes), state.nodes_key), address)
         assert isinstance(sent, bool)
 
     # Parents: handle_query
@@ -389,7 +509,8 @@ class DhtCrawler:
     def handle_sample_infohashes_query(self, transaction_id: bytes, reply_id: bytes, address: Address, node_socket: NodeSocket) -> None:
         assert len(reply_id) == NODE_ID_LENGTH
         recent = list(self.recent_hashes)[-SAMPLES_PER_RESPONSE:]
-        response = build_sample_infohashes_response(transaction_id, reply_id, OWN_SAMPLE_INTERVAL, encode_compact_nodes(self.recent_nodes), len(self.recent_hashes), b"".join(recent))
+        state = self.families[node_socket.family]
+        response = build_sample_infohashes_response(transaction_id, reply_id, OWN_SAMPLE_INTERVAL, encode_compact_nodes(state.recent_nodes), len(self.recent_hashes), b"".join(recent), state.nodes_key)
         sent = self.send_message(node_socket, response, address)
         assert isinstance(sent, bool)
 
@@ -406,28 +527,45 @@ class DhtCrawler:
     # Keywords: crawl, batch, queue, bep51
     def crawl_step(self) -> int:
         assert self.batch_size >= 1
-        if not self.node_queue and self.clock() - self.last_bootstrap_time >= BOOTSTRAP_RETRY_SECONDS:
-            self.bootstrap()
-        limit = self.batch_size * len(self.node_sockets)
+        now = self.clock()
+        starving = [family for family, state in self.families.items() if not state.node_queue and now - state.last_bootstrap_time >= BOOTSTRAP_RETRY_SECONDS]
+        if starving:
+            self.bootstrap(starving)
         sent = 0
-        while self.node_queue and sent < limit:
-            self.send_crawl_query(self.node_queue.popleft())
-            sent += 1
-        assert 0 <= sent <= limit
+        for state in self.families.values():
+            limit = self.batch_size * len(state.node_sockets)
+            count = 0
+            while state.node_queue and count < limit:
+                self.send_crawl_query(state.node_queue.popleft())
+                count += 1
+            sent += count
+        assert 0 <= sent <= self.batch_size * len(self.node_sockets)
         return sent
 
+    # Parents: start_pending_lookups
+    # Keywords: seed nodes, closest, queue scan, recent nodes
+    def seed_nodes(self, info_hash: bytes) -> List[Node]:
+        assert len(info_hash) == NODE_ID_LENGTH
+        scan_each = LOOKUP_SEED_SCAN // len(self.families)
+        queued = itertools.chain.from_iterable(itertools.islice(state.node_queue, 0, scan_each) for state in self.families.values())
+        recent = [node for state in self.families.values() for node in state.recent_nodes]
+        result = select_closest_nodes(queued, info_hash, LOOKUP_SEED_COUNT) + recent
+        assert len(result) <= LOOKUP_SEED_COUNT + RECENT_NODES_SIZE * len(self.families)
+        return result
+
     # Parents: run
-    # Keywords: lookups, seed nodes, candidates, rate limited scan
+    # Keywords: lookups, hint node, backpressure, fetchable backlog, token budget
     def start_pending_lookups(self, now: float) -> int:
         assert now >= 0
-        slots = self.lookup_manager.free_slots()
+        room = self.lookup_fetchable_target - self.catalog.fetchable_count()
+        slots = min(self.lookup_manager.free_slots(), room, int(self.lookup_manager.refill(now)))
         started = 0
-        if slots == 0 or now < self.next_lookup_scan:
+        if slots <= 0:
             return 0
-        self.next_lookup_scan = now + LOOKUP_SCAN_INTERVAL_SECONDS
         for info_hash in self.catalog.hashes_needing_peers(slots):
-            seed = select_closest_nodes(itertools.islice(self.node_queue, 0, LOOKUP_SEED_SCAN), info_hash, LOOKUP_SEED_COUNT) + list(self.recent_nodes)
-            if self.lookup_manager.start_lookup(info_hash, seed, now):
+            hint = self.hint_nodes.get(info_hash)
+            seeds = list(self.families[address_family(hint[1])].recent_nodes) if hint is not None else self.seed_nodes(info_hash)
+            if self.lookup_manager.start_lookup(info_hash, seeds, now, hint):
                 started += 1
             else:
                 self.catalog.release_lookup_claim(info_hash)
@@ -436,16 +574,20 @@ class DhtCrawler:
         return started
 
     # Parents: run, tests
-    # Keywords: receive, select, multi socket, drain
+    # Keywords: receive, selectors, multi socket, drain, high descriptors
     def receive_pending(self, timeout: float) -> int:
         assert timeout >= 0, "timeout must not be negative"
+        if self.selector is None:
+            self.selector = selectors.DefaultSelector()
+            for node in self.node_sockets:
+                self.selector.register(node.udp_socket, selectors.EVENT_READ, node)
         handled = 0
-        readable, _, _ = select.select([node.udp_socket for node in self.node_sockets], [], [], timeout)
-        for udp_socket in readable:
-            node_socket = self.socket_index[id(udp_socket)]
+        for key, _ in self.selector.select(timeout):
+            node_socket = key.data
+            udp_socket = node_socket.udp_socket
             for _ in range(MAX_RECEIVE_PER_SOCKET):
                 try:
-                    data, address = udp_socket.recvfrom(MAX_DATAGRAM_SIZE)
+                    data, raw_address = udp_socket.recvfrom(MAX_DATAGRAM_SIZE)
                 except BlockingIOError:
                     break
                 except ConnectionResetError:
@@ -453,10 +595,19 @@ class DhtCrawler:
                 except OSError as error:
                     LOGGER.debug("receive failed: %s", error)
                     break
-                self.handle_datagram(data, address, node_socket)
+                self.handle_datagram(data, (raw_address[0], raw_address[1]), node_socket)
                 handled += 1
         assert handled >= 0
         return handled
+
+    # Parents: run, tests
+    # Keywords: selector, close, cleanup
+    def close(self) -> None:
+        assert self.node_sockets
+        if self.selector is not None:
+            self.selector.close()
+            self.selector = None
+        assert self.selector is None
 
     # Parents: ScraperRuntime.snapshot_stats, run
     # Keywords: statistics, snapshot, single writer
@@ -464,7 +615,8 @@ class DhtCrawler:
         assert all(key in self.stats for key in COUNTER_KEYS)
         stats = dict(self.stats)
         stats["queue_size"] = len(self.node_queue)
-        stats["active_lookups"] = len(self.lookup_manager.active)
+        stats["queue_size6"] = len(self.families[socket.AF_INET6].node_queue) if socket.AF_INET6 in self.families else 0
+        stats.update(self.lookup_manager.snapshot_counts())
         assert all(key in stats for key in STATS_KEYS)
         return stats
 
@@ -481,9 +633,10 @@ class DhtCrawler:
                 self.crawl_step()
                 self.lookup_manager.tick(now)
                 self.start_pending_lookups(now)
-                next_send = now + self.interval
+                next_send = next_batch_time(next_send, now, self.interval)
             self.receive_pending(max(0.0, min(self.interval, next_send - self.clock())))
         self.lookup_manager.abort_all()
+        self.close()
         stats = self.snapshot_stats()
         LOGGER.info("crawler stopped")
         assert all(key in stats for key in STATS_KEYS)

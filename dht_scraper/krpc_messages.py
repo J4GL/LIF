@@ -9,7 +9,11 @@ from dht_scraper.bencode_codec import is_plain_int
 from dht_scraper.node_identity import NODE_ID_LENGTH
 
 COMPACT_ADDRESS_LENGTH = 6
+COMPACT_ADDRESS6_LENGTH = 18
 COMPACT_NODE_LENGTH = NODE_ID_LENGTH + COMPACT_ADDRESS_LENGTH
+COMPACT_NODE6_LENGTH = NODE_ID_LENGTH + COMPACT_ADDRESS6_LENGTH
+NODES_KEY = b"nodes"
+NODES6_KEY = b"nodes6"
 TOKEN_LENGTH = 8
 ERROR_GENERIC = 201
 ERROR_SERVER = 202
@@ -25,63 +29,102 @@ Address = Tuple[str, int]
 Message = Dict[bytes, Any]
 
 
-# Parents: encode_compact_nodes
-# Keywords: compact address, ipv4, port, pack
+# Parents: encode_compact_nodes, encode_compact_peers
+# Keywords: compact address, ipv4, ipv6, port, pack
 def encode_compact_address(ip: str, port: int) -> bytes:
     assert 0 <= port <= 65535, "port out of range"
-    result = socket.inet_aton(ip) + struct.pack("!H", port)
-    assert len(result) == COMPACT_ADDRESS_LENGTH
+    packed = socket.inet_pton(socket.AF_INET6, ip) if ":" in ip else socket.inet_aton(ip)
+    result = packed + struct.pack("!H", port)
+    assert len(result) in (COMPACT_ADDRESS_LENGTH, COMPACT_ADDRESS6_LENGTH)
     return result
 
 
-# Parents: decode_compact_nodes
-# Keywords: compact address, ipv4, port, unpack
+# Parents: decode_compact_nodes, decode_compact_nodes6, decode_compact_peers
+# Keywords: compact address, ipv4, ipv6, port, unpack
 def decode_compact_address(data: bytes) -> Tuple[str, int]:
-    assert len(data) == COMPACT_ADDRESS_LENGTH, "compact address must be 6 bytes"
-    ip = socket.inet_ntoa(data[:4])
-    port = struct.unpack("!H", data[4:6])[0]
+    assert len(data) in (COMPACT_ADDRESS_LENGTH, COMPACT_ADDRESS6_LENGTH), "compact address must be 6 or 18 bytes"
+    ip = socket.inet_ntop(socket.AF_INET6, data[:16]) if len(data) == COMPACT_ADDRESS6_LENGTH else socket.inet_ntoa(data[:4])
+    port = struct.unpack("!H", data[-2:])[0]
     assert 0 <= port <= 65535
     return ip, port
 
 
 # Parents: DhtCrawler.handle_find_node_query, DhtCrawler.handle_get_peers_query
-# Keywords: compact nodes, encode, routing, find_node
+# Keywords: compact nodes, encode, routing, find_node, one family
 def encode_compact_nodes(nodes: Sequence[Node]) -> bytes:
     assert all(len(node[0]) == NODE_ID_LENGTH for node in nodes), "node id must be 20 bytes"
     result = b"".join(node_id + encode_compact_address(ip, port) for node_id, ip, port in nodes)
-    assert len(result) == COMPACT_NODE_LENGTH * len(nodes)
+    assert len(result) in (COMPACT_NODE_LENGTH * len(nodes), COMPACT_NODE6_LENGTH * len(nodes))
     return result
 
 
-# Parents: DhtCrawler.add_node, DhtCrawler.handle_response
-# Keywords: routable, address filter, loopback, multicast, port
-def is_routable_address(ip: str, port: int) -> bool:
-    assert isinstance(ip, str) and isinstance(port, int)
-    try:
-        parsed = ipaddress.ip_address(ip)
-    except ValueError:
-        return False
-    result = (
-        parsed.version == 4
-        and 0 < port <= 65535
-        and not (parsed.is_unspecified or parsed.is_loopback or parsed.is_multicast or parsed.is_link_local)
+# Parents: is_routable_address
+# Keywords: ipv4, special purpose, private, reserved, rfc 6890
+def is_global_ipv4(octets: Sequence[int]) -> bool:
+    assert len(octets) == 4
+    first, second, third = octets[0], octets[1], octets[2]
+    result = not (
+        first in (0, 10, 127) or first >= 224
+        or (first == 100 and 64 <= second <= 127)
+        or (first == 169 and second == 254)
+        or (first == 172 and 16 <= second <= 31)
+        or (first == 192 and (second == 168 or (second == 0 and third in (0, 2)) or (second == 88 and third == 99)))
+        or (first == 198 and (second in (18, 19) or (second == 51 and third == 100)))
+        or (first == 203 and second == 0 and third == 113)
     )
     assert isinstance(result, bool)
     return result
 
 
-# Parents: DhtCrawler.handle_response
-# Keywords: compact nodes, decode, routing, find_node
-def decode_compact_nodes(data: bytes) -> List[Node]:
+# Parents: is_routable_address
+# Keywords: ipv6, global unicast, documentation, mapped
+def is_global_ipv6(ip: str) -> bool:
+    assert ":" in ip
+    try:
+        parsed = ipaddress.IPv6Address(ip)
+    except ValueError:
+        return False
+    result = parsed.is_global and not parsed.is_multicast and parsed.ipv4_mapped is None and (parsed.packed[0] & 0xE0) == 0x20
+    assert isinstance(result, bool)
+    return result
+
+
+# Parents: DhtCrawler.is_foreign_node, DhtCrawler.handle_announce_peer_query, LookupManager.handle_response
+# Keywords: routable, global address, dotted quad, ipv6, port
+def is_routable_address(ip: str, port: int) -> bool:
+    assert isinstance(ip, str) and isinstance(port, int)
+    if ":" in ip:
+        return 0 < port <= 65535 and is_global_ipv6(ip)
+    parts = ip.split(".")
+    if not 0 < port <= 65535 or len(parts) != 4 or not all(part.isdigit() and len(part) <= 3 for part in parts):
+        return False
+    octets = [int(part) for part in parts]
+    result = max(octets) <= 255 and is_global_ipv4(octets)
+    assert isinstance(result, bool)
+    return result
+
+
+# Parents: DhtCrawler.handle_response, LookupManager.handle_response
+# Keywords: compact nodes, decode, routing, find_node, ipv4
+def decode_compact_nodes(data: bytes, entry_length: int = COMPACT_NODE_LENGTH) -> List[Node]:
     assert isinstance(data, bytes), "data must be bytes"
     nodes: List[Node] = []
-    last_start = len(data) - COMPACT_NODE_LENGTH
-    for offset in range(0, last_start + 1, COMPACT_NODE_LENGTH):
+    last_start = len(data) - entry_length
+    for offset in range(0, last_start + 1, entry_length):
         node_id = data[offset:offset + NODE_ID_LENGTH]
-        ip, port = decode_compact_address(data[offset + NODE_ID_LENGTH:offset + COMPACT_NODE_LENGTH])
+        ip, port = decode_compact_address(data[offset + NODE_ID_LENGTH:offset + entry_length])
         nodes.append((node_id, ip, port))
-    assert len(nodes) == len(data) // COMPACT_NODE_LENGTH
+    assert len(nodes) == len(data) // entry_length
     return nodes
+
+
+# Parents: DhtCrawler.handle_response, LookupManager.handle_response
+# Keywords: compact nodes, decode, nodes6, ipv6, bep 32
+def decode_compact_nodes6(data: bytes) -> List[Node]:
+    assert isinstance(data, bytes)
+    result = decode_compact_nodes(data, COMPACT_NODE6_LENGTH)
+    assert len(result) == len(data) // COMPACT_NODE6_LENGTH
+    return result
 
 
 # Parents: DhtCrawler.send_find_node, DhtCrawler.handle_error
@@ -109,23 +152,23 @@ def build_ping_response(transaction_id: bytes, node_id: bytes) -> Message:
 
 # Parents: DhtCrawler.handle_find_node_query
 # Keywords: krpc, response, find_node, nodes, build
-def build_find_node_response(transaction_id: bytes, node_id: bytes, compact_nodes: bytes) -> Message:
-    assert len(node_id) == NODE_ID_LENGTH and len(compact_nodes) % COMPACT_NODE_LENGTH == 0
-    result: Message = {b"t": transaction_id, b"y": b"r", b"r": {b"id": node_id, b"nodes": compact_nodes}}
-    assert result[b"r"][b"nodes"] == compact_nodes
+def build_find_node_response(transaction_id: bytes, node_id: bytes, compact_nodes: bytes, nodes_key: bytes = NODES_KEY) -> Message:
+    assert len(node_id) == NODE_ID_LENGTH and nodes_key in (NODES_KEY, NODES6_KEY)
+    result: Message = {b"t": transaction_id, b"y": b"r", b"r": {b"id": node_id, nodes_key: compact_nodes}}
+    assert result[b"r"][nodes_key] == compact_nodes
     return result
 
 
 # Parents: DhtCrawler.handle_get_peers_query
 # Keywords: krpc, response, get_peers, token, build
-def build_get_peers_response(transaction_id: bytes, node_id: bytes, token: bytes, compact_nodes: bytes) -> Message:
-    assert len(node_id) == NODE_ID_LENGTH and len(token) > 0
+def build_get_peers_response(transaction_id: bytes, node_id: bytes, token: bytes, compact_nodes: bytes, nodes_key: bytes = NODES_KEY) -> Message:
+    assert len(node_id) == NODE_ID_LENGTH and len(token) > 0 and nodes_key in (NODES_KEY, NODES6_KEY)
     result: Message = {
         b"t": transaction_id,
         b"y": b"r",
-        b"r": {b"id": node_id, b"token": token, b"nodes": compact_nodes},
+        b"r": {b"id": node_id, b"token": token, nodes_key: compact_nodes},
     }
-    assert all(key in result[b"r"] for key in (b"id", b"token", b"nodes"))
+    assert all(key in result[b"r"] for key in (b"id", b"token", nodes_key))
     return result
 
 
@@ -178,16 +221,16 @@ def build_sample_infohashes_query(transaction_id: bytes, node_id: bytes, target_
 # Parents: DhtCrawler.handle_sample_infohashes_query
 # Keywords: krpc, response, sample_infohashes, bep51, build
 def build_sample_infohashes_response(
-    transaction_id: bytes, node_id: bytes, interval: int, compact_nodes: bytes, num: int, samples: bytes
+    transaction_id: bytes, node_id: bytes, interval: int, compact_nodes: bytes, num: int, samples: bytes, nodes_key: bytes = NODES_KEY
 ) -> Message:
-    assert len(node_id) == NODE_ID_LENGTH and 0 <= interval <= MAX_SAMPLE_INTERVAL
-    assert len(samples) % NODE_ID_LENGTH == 0 and num >= 0 and len(compact_nodes) % COMPACT_NODE_LENGTH == 0
+    assert len(node_id) == NODE_ID_LENGTH and 0 <= interval <= MAX_SAMPLE_INTERVAL and nodes_key in (NODES_KEY, NODES6_KEY)
+    assert len(samples) % NODE_ID_LENGTH == 0 and num >= 0
     result: Message = {
         b"t": transaction_id,
         b"y": b"r",
-        b"r": {b"id": node_id, b"interval": interval, b"nodes": compact_nodes, b"num": num, b"samples": samples},
+        b"r": {b"id": node_id, b"interval": interval, nodes_key: compact_nodes, b"num": num, b"samples": samples},
     }
-    assert all(key in result[b"r"] for key in (b"interval", b"nodes", b"num", b"samples"))
+    assert all(key in result[b"r"] for key in (b"interval", nodes_key, b"num", b"samples"))
     return result
 
 
@@ -206,7 +249,7 @@ def decode_compact_peers(values: Any) -> List[Address]:
     assert COMPACT_ADDRESS_LENGTH == 6
     if not isinstance(values, list):
         return []
-    result = [decode_compact_address(item) for item in values if isinstance(item, bytes) and len(item) == COMPACT_ADDRESS_LENGTH]
+    result = [decode_compact_address(item) for item in values if isinstance(item, bytes) and len(item) in (COMPACT_ADDRESS_LENGTH, COMPACT_ADDRESS6_LENGTH)]
     assert all(0 <= port <= 65535 for _, port in result)
     return result
 

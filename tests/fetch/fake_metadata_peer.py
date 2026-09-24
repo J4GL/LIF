@@ -27,7 +27,10 @@ from dht_scraper.peer_wire_messages import (
     encode_handshake,
 )
 
-MODES = ("ok", "no_extensions", "no_ut_metadata", "too_large", "reject", "corrupt", "silent", "close_after_handshake", "wrong_hash", "huge_frame")
+MODES = (
+    "ok", "no_extensions", "no_ut_metadata", "too_large", "reject", "corrupt", "silent", "close_after_handshake", "wrong_hash", "huge_frame",
+    "expect_pipelined", "wait_for_all_requests", "silent_before_handshake",
+)
 
 
 def build_info_dict(name=b"test.txt", length=1234, extra_pieces=0):
@@ -47,7 +50,7 @@ def read_exact(conn, length):
 
 
 class FakeMetadataPeer:
-    def __init__(self, info_hash, metadata, mode="ok", their_id=3, send_noise=True):
+    def __init__(self, info_hash, metadata, mode="ok", their_id=3, send_noise=True, host="127.0.0.1"):
         assert mode in MODES
         self.info_hash = info_hash
         self.metadata = metadata
@@ -55,11 +58,12 @@ class FakeMetadataPeer:
         self.their_id = their_id
         self.send_noise = send_noise
         self.requests = []
-        self.listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self.listener.bind(("127.0.0.1", 0))
+        self.saw_pipelined_handshake = False
+        self.listener = socket.socket(socket.AF_INET6 if ":" in host else socket.AF_INET, socket.SOCK_STREAM)
+        self.listener.bind((host, 0))
         self.listener.listen(5)
         self.listener.settimeout(0.2)
-        self.address = ("127.0.0.1", self.listener.getsockname()[1])
+        self.address = (host, self.listener.getsockname()[1])
         self.running = True
         self.thread = threading.Thread(target=self.accept_loop, name="fake-peer", daemon=True)
         self.thread.start()
@@ -89,6 +93,14 @@ class FakeMetadataPeer:
         info_hash, _, _ = decode_handshake(read_exact(conn, HANDSHAKE_LENGTH))
         if self.mode == "close_after_handshake":
             return
+        if self.mode == "silent_before_handshake":
+            time.sleep(2.5)
+            return
+        if self.mode == "expect_pipelined":
+            conn.settimeout(1.0)
+            body = read_exact(conn, decode_frame_length(read_exact(conn, FRAME_HEADER_LENGTH)))
+            self.saw_pipelined_handshake = body[0] == MESSAGE_EXTENDED and body[1] == EXTENDED_HANDSHAKE_ID
+            conn.settimeout(3.0)
         reply_hash = b"\x99" * 20 if self.mode == "wrong_hash" else info_hash
         handshake = bytearray(encode_handshake(reply_hash, b"-FK0001-" + b"f" * 12))
         if self.mode == "no_extensions":
@@ -108,6 +120,7 @@ class FakeMetadataPeer:
         extensions = {} if self.mode == "no_ut_metadata" else {b"ut_metadata": self.their_id}
         size = 100 * 1024 * 1024 if self.mode == "too_large" else len(self.metadata)
         conn.sendall(encode_extended_message(EXTENDED_HANDSHAKE_ID, {b"m": extensions, b"metadata_size": size, b"v": b"fake"}))
+        piece_total = (len(self.metadata) + METADATA_PIECE_SIZE - 1) // METADATA_PIECE_SIZE
         while True:
             length = decode_frame_length(read_exact(conn, FRAME_HEADER_LENGTH))
             body = read_exact(conn, length)
@@ -126,7 +139,16 @@ class FakeMetadataPeer:
             if self.mode == "reject":
                 conn.sendall(encode_extended_message(UT_METADATA_LOCAL_ID, {b"msg_type": MSG_TYPE_REJECT, b"piece": piece}))
                 continue
-            data = self.metadata[piece * METADATA_PIECE_SIZE:(piece + 1) * METADATA_PIECE_SIZE]
-            if self.mode == "corrupt" and piece == 0:
-                data = bytes([data[0] ^ 0xff]) + data[1:]
-            conn.sendall(encode_extended_message(UT_METADATA_LOCAL_ID, {b"msg_type": MSG_TYPE_DATA, b"piece": piece, b"total_size": len(self.metadata)}, data))
+            if self.mode == "wait_for_all_requests":
+                if len(self.requests) < piece_total:
+                    continue
+                for requested in self.requests:
+                    self.send_piece(conn, requested)
+                continue
+            self.send_piece(conn, piece)
+
+    def send_piece(self, conn, piece):
+        data = self.metadata[piece * METADATA_PIECE_SIZE:(piece + 1) * METADATA_PIECE_SIZE]
+        if self.mode == "corrupt" and piece == 0:
+            data = bytes([data[0] ^ 0xff]) + data[1:]
+        conn.sendall(encode_extended_message(UT_METADATA_LOCAL_ID, {b"msg_type": MSG_TYPE_DATA, b"piece": piece, b"total_size": len(self.metadata)}, data))

@@ -11,6 +11,7 @@ from dht_scraper.krpc_messages import (
     build_sample_infohashes_query,
     build_sample_infohashes_response,
     decode_compact_nodes,
+    decode_compact_nodes6,
     decode_compact_peers,
     decode_samples,
     encode_compact_nodes,
@@ -39,13 +40,33 @@ class CompactNodesTest(unittest.TestCase):
 
 
 class RoutableAddressTest(unittest.TestCase):
-    def test_accepts_public_and_private_addresses(self):
-        self.assertTrue(is_routable_address("1.2.3.4", 6881))
-        self.assertTrue(is_routable_address("10.0.0.1", 1))
+    def test_CRAWL_004_only_global_ipv4_is_routable(self):
+        routable = [("81.2.3.4", 6881), ("1.1.1.1", 1)]
+        rejected = [
+            "0.1.2.3", "10.0.0.1", "100.64.0.1", "127.0.0.1", "169.254.1.1", "172.16.0.1", "172.31.255.255", "192.0.2.1",
+            "192.168.1.1", "198.18.0.1", "198.51.100.1", "203.0.113.1", "224.0.0.1", "240.0.0.1", "255.255.255.255", "not.an.ip.x", "1.2.3",
+        ]
+        cases = routable + [(ip, 6881) for ip in rejected] + [("81.2.3.4", 0)]
+        results = [(ip, port) for ip, port in cases if is_routable_address(ip, port)]
+        self.assertEqual(results, routable)
 
     def test_rejects_special_addresses_and_ports(self):
         for ip, port in [("0.0.0.0", 6881), ("127.0.0.1", 6881), ("224.0.0.1", 6881), ("169.254.1.1", 6881), ("1.2.3.4", 0), ("1.2.3.4", 65536), ("not-an-ip", 6881), ("2001:db8::1", 6881)]:
             self.assertFalse(is_routable_address(ip, port), msg="%s:%d" % (ip, port))
+
+
+class Ipv6FormatsTest(unittest.TestCase):
+    def test_V6_001_ipv6_compact_formats_and_routing(self):
+        node = (b"i" * 20, "2a01:e0a::1", 6881)
+        encoded = encode_compact_nodes([node])
+        self.assertEqual(len(encoded), 38)
+        self.assertEqual(decode_compact_nodes6(encoded), [node])
+        peer6, peer4 = ("2a01:e0a::2", 51413), ("81.2.3.4", 6881)
+        values = encode_compact_peers([peer6, peer4])
+        self.assertEqual([len(item) for item in values], [18, 6])
+        self.assertEqual(decode_compact_peers(values), [peer6, peer4])
+        candidates = ("2a01:e0a::1", "::1", "fe80::1", "fd00::1", "2001:db8::1", "ff0e::1", "::ffff:81.2.3.4", "::")
+        self.assertEqual([ip for ip in candidates if is_routable_address(ip, 6881)], ["2a01:e0a::1"])
 
 
 class MessageBuildersTest(unittest.TestCase):

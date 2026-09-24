@@ -2,11 +2,11 @@
 import unittest
 
 from dht_scraper.node_identity import (
-    generate_lookup_transaction_id,
     generate_node_id,
     generate_peer_id,
     generate_transaction_id,
     is_valid_node_id,
+    lookup_transaction_id,
     neighbor_node_id,
     select_closest_nodes,
     xor_distance,
@@ -48,9 +48,9 @@ class LookupIdentityTest(unittest.TestCase):
         self.assertEqual(select_closest_nodes([], target, 5), [])
 
     def test_lookup_transaction_and_peer_id(self):
-        transaction_id = generate_lookup_transaction_id()
-        self.assertEqual(len(transaction_id), 4)
-        self.assertEqual(transaction_id[:1], b"L")
+        self.assertEqual(lookup_transaction_id(0), b"L\x00\x00\x00")
+        self.assertEqual(lookup_transaction_id(0x010203), b"L\x01\x02\x03")
+        self.assertEqual(lookup_transaction_id(2 ** 24 + 5), b"L\x00\x00\x05")
         peer_id = generate_peer_id()
         self.assertEqual(len(peer_id), 20)
         self.assertTrue(peer_id.startswith(b"-DS0002-"))
