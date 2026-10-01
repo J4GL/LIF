@@ -97,6 +97,7 @@ class SearchIndexer:
         self.thread: Optional[threading.Thread] = None
         self.lock = threading.Lock()
         self.documents: Optional[int] = None
+        self.total_size = 0
         self.upserts = 0
         self.updates = 0
         self.errors = 0
@@ -239,9 +240,10 @@ class SearchIndexer:
     # Parents: start, run_due_work
     # Keywords: count, documents, statistics
     def refresh_count(self) -> None:
-        count = self.database.count_documents()
+        count, size = self.database.document_totals()
         with self.lock:
             self.documents = count
+            self.total_size = size
         assert count >= 0
 
     # Parents: start, run_due_work, final_flush
@@ -268,5 +270,6 @@ class SearchIndexer:
             }
             if self.documents is not None:
                 result["index_documents"] = self.documents
+                result["index_total_size"] = self.total_size
         assert result["index_errors"] >= 0
         return result

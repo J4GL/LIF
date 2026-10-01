@@ -313,6 +313,17 @@ class TorrentDatabase:
         assert result >= 0
         return result
 
+    # Parents: SearchIndexer.refresh_count, tests
+    # Keywords: count, total size, statistics
+    def document_totals(self) -> Tuple[int, int]:
+        connection = self.connect_reader()
+        try:
+            count, size = connection.execute("SELECT count(*), coalesce(sum(size), 0) FROM torrents").fetchone()
+        finally:
+            connection.close()
+        assert count >= 0 and size >= 0
+        return count, size
+
     # Parents: CatalogRequestHandler.render_torrent, tests
     # Keywords: detail, document, files json
     def get_document(self, info_hash: str) -> Optional[Document]:

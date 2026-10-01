@@ -16,7 +16,7 @@ from dht_scraper.torrent_catalog import SOURCE_SAMPLE, TorrentCatalog
 from dht_scraper.torrent_database import TorrentDatabase
 from dht_scraper.torrent_info_summary import TorrentFile, TorrentMetadata
 from tests.fetch.fake_metadata_peer import build_info_dict
-from tests.search.database_fixtures import temporary_directory, user_version
+from tests.search.database_fixtures import document, open_database, temporary_directory, user_version
 from tests.shared_fixtures import http_get_json, wait_until
 
 BOOTSTRAP = [("127.0.0.1", 1)]
@@ -301,6 +301,35 @@ class ScraperRuntimeTest(unittest.TestCase):
         reader = TorrentDatabase(path)
         self.assertEqual(reader.get_document(info_hash.hex())["seen_count"], 3)
         self.assertEqual(len(reader.search("", 10)), 1)
+
+    def test_RUNTIME_008_torrent_count_and_size(self):
+        def metadata(byte, size):
+            return TorrentMetadata(bytes([byte]) * 20, "m%d" % byte, size, 16384, 1, [TorrentFile("m%d" % byte, size)], False, 1.0, None)
+
+        with self.subTest(case="memory"):
+            runtime = self.make_runtime(settings(nodes=1, fetch_enabled=False))
+            runtime.start()
+            try:
+                self.catalog.store_metadata(metadata(1, 5))
+                self.catalog.store_metadata(metadata(2, 7))
+                self.catalog.store_metadata(metadata(1, 5))
+                _, stats = self.get_json(runtime, "/api/stats")
+                self.assertEqual((stats["torrents"], stats["torrents_size"]), (2, 12))
+            finally:
+                runtime.stop()
+        with self.subTest(case="database"):
+            path = os.path.join(temporary_directory(self), "torrents.sqlite3")
+            seeded = open_database(self, [document(1, "one", lengths=[100]), document(2, "two", lengths=[200])], path=path)
+            seeded.close()
+            catalog = TorrentCatalog()
+            runtime = ScraperRuntime(settings(nodes=1, fetch_enabled=False, database_path=path), catalog, never_fetch, BOOTSTRAP, browser_opener=self.opened.append, indexer_options=FAST_INDEX)
+            runtime.start()
+            try:
+                catalog.store_metadata(metadata(3, 5))
+                self.assertTrue(wait_until(lambda: self.get_json(runtime, "/api/stats")[1].get("torrents") == 3, timeout=3.0))
+                self.assertEqual(self.get_json(runtime, "/api/stats")[1]["torrents_size"], 305)
+            finally:
+                runtime.stop()
 
     def test_SEARCH_001_database_opened_at_start(self):
         with self.subTest(case="new"):

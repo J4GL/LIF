@@ -19,7 +19,7 @@ from dht_scraper.web_page import render_index_page
 LOGGER = logging.getLogger(LOGGER_NAME)
 DEFAULT_WEB_HOST = "127.0.0.1"
 DEFAULT_WEB_PORT = 8080
-DEFAULT_SEARCH_LIMIT = 50
+DEFAULT_SEARCH_LIMIT = 20
 MAX_SEARCH_LIMIT = 200
 MAX_QUERY_LENGTH = 200
 ROUTE_TORRENT_PREFIX = "/api/torrent/"

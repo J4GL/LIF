@@ -172,6 +172,7 @@ class TorrentCatalog:
         self._index_counters: Dict[bytes, TorrentEntry] = {}
         self._index_dropped = 0
         self._check_database = False
+        self._metadata_bytes = 0
         self._needs_check: Dict[bytes, TorrentEntry] = {}
         self.max_entries = max_entries
         self.max_peers_per_hash = max_peers_per_hash
@@ -303,6 +304,8 @@ class TorrentCatalog:
         moment = moment_or_now(now)
         with self._lock:
             entry, created = self._get_or_create_locked(metadata.info_hash, moment)
+            if entry.fetch_state != FETCH_DONE:
+                self._metadata_bytes += metadata.total_size
             entry.metadata = metadata
             entry.last_error = ""
             self._set_state_locked(entry, FETCH_DONE)
@@ -366,6 +369,7 @@ class TorrentCatalog:
                 "observations": self._observations,
                 "with_metadata": self._state_counts[FETCH_DONE],
                 "metadata_in_memory": len(self._fetched),
+                "metadata_bytes": self._metadata_bytes,
                 "fetch_pending": self._state_counts[FETCH_PENDING],
                 "fetch_in_progress": self._state_counts[FETCH_IN_PROGRESS],
                 "fetch_done": self._state_counts[FETCH_DONE],

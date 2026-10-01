@@ -339,6 +339,10 @@ class ScraperRuntime:
             stats.update(self.fetch_engine.snapshot_counts())
         if self.indexer is not None:
             stats.update(self.indexer.snapshot_counts())
+        if "index_documents" in stats:
+            stats["torrents"], stats["torrents_size"] = stats["index_documents"], stats["index_total_size"]
+        elif self.indexer is None:
+            stats["torrents"], stats["torrents_size"] = stats["with_metadata"], stats["metadata_bytes"]
         assert "hashes_seen" in stats and "uptime_seconds" in stats
         return stats
 

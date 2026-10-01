@@ -9,7 +9,7 @@ from dht_scraper.torrent_info_summary import TorrentFile, TorrentMetadata
 from tests.search.database_fixtures import FailingDatabase, document, info_hash_hex, open_database
 from tests.shared_fixtures import wait_until
 
-STAT_KEYS = ["index_backlog", "index_checked", "index_documents", "index_dropped", "index_errors", "index_known", "index_updates", "index_upserts"]
+STAT_KEYS = ["index_backlog", "index_checked", "index_documents", "index_dropped", "index_errors", "index_known", "index_total_size", "index_updates", "index_upserts"]
 FAST = {"document_seconds": 0.05, "counter_seconds": 0.05, "count_seconds": 0.05}
 
 

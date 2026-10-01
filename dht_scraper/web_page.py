@@ -11,8 +11,11 @@ INDEX_PAGE_HTML = """<!DOCTYPE html>
   body { margin: 0; font: 14px/1.4 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
   header { padding: 12px 16px; border-bottom: 1px solid var(--line); }
   h1 { margin: 0 0 8px; font-size: 18px; }
-  #stats { display: flex; flex-wrap: wrap; gap: 6px 18px; font-size: 13px; }
+  #stats { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 18px; font-size: 13px; }
+  #stats-summary, #stats-more { display: flex; flex-wrap: wrap; gap: 6px 18px; }
+  #stats-more[hidden] { display: none; }
   #stats b { font-variant-numeric: tabular-nums; }
+  #stats-toggle { padding: 1px 8px; font-size: 12px; }
   main { display: grid; grid-template-columns: 1fr; gap: 16px; padding: 16px; }
   @media (min-width: 1000px) { main { grid-template-columns: 3fr 2fr; } }
   form { display: flex; gap: 8px; margin-bottom: 10px; }
@@ -40,7 +43,13 @@ INDEX_PAGE_HTML = """<!DOCTYPE html>
 <header>
   <h1>DHT scraper</h1>
   <div id="stats">
-    <span>uptime <b data-stat="uptime_seconds">0</b>s</span>
+    <div id="stats-summary">
+      <span>uptime <b data-stat="uptime_seconds">0</b></span>
+      <span>torrents <b data-stat="torrents">-</b></span>
+      <span>total size <b data-stat="torrents_size">-</b></span>
+    </div>
+    <button id="stats-toggle" type="button" aria-controls="stats-more" aria-expanded="false" title="all statistics">&gt;&gt;</button>
+    <div id="stats-more" hidden>
     <span>nodes <b data-stat="nodes">0</b></span>
     <span>hashes <b data-stat="hashes_seen">0</b></span>
     <span>with metadata <b data-stat="with_metadata">0</b></span>
@@ -53,13 +62,14 @@ INDEX_PAGE_HTML = """<!DOCTYPE html>
     <span>sent <b data-stat="packets_sent">0</b></span>
     <span>received <b data-stat="packets_received">0</b></span>
     <span>in database <b data-stat="index_documents">-</b></span>
+    </div>
   </div>
 </header>
 <main>
   <section id="search">
     <form id="search-form">
       <input id="query" type="search" placeholder="Search torrent names and file paths" autocomplete="off">
-      <input id="limit" type="number" min="1" max="200" value="50" title="max results">
+      <input id="limit" type="number" min="1" max="200" value="20" title="max results">
       <button type="submit">Search</button>
     </form>
     <table id="results">
@@ -90,6 +100,10 @@ INDEX_PAGE_HTML = """<!DOCTYPE html>
     while (v >= 1024 && i < units.length - 1) { v /= 1024; i += 1; }
     return (i === 0 ? v : v.toFixed(1)) + " " + units[i];
   }
+  function formatDuration(seconds) {
+    var s = Math.max(0, Math.round(Number(seconds) || 0)); var d = Math.floor(s / 86400); var h = Math.floor(s % 86400 / 3600); var m = Math.floor(s % 3600 / 60);
+    return (d ? d + "d " : "") + (d || h ? h + "h " : "") + (d || h || m ? m + "m " : "") + (s % 60) + "s";
+  }
   function formatTime(unix) { return unix ? new Date(unix * 1000).toLocaleTimeString() : "-"; }
   function cell(row, text, cls) { var td = document.createElement("td"); td.textContent = text; if (cls) { td.className = cls; } row.appendChild(td); return td; }
   function fetchJson(url) { return fetch(url, { cache: "no-store" }).then(function (r) { return r.json(); }); }
@@ -99,7 +113,7 @@ INDEX_PAGE_HTML = """<!DOCTYPE html>
       var spans = document.querySelectorAll("[data-stat]");
       for (var i = 0; i < spans.length; i += 1) {
         var key = spans[i].getAttribute("data-stat"); var value = stats[key];
-        spans[i].textContent = value === undefined ? "-" : (key === "uptime_seconds" ? Math.round(value) : String(value));
+        spans[i].textContent = value === undefined ? "-" : (key === "uptime_seconds" ? formatDuration(value) : key === "torrents_size" ? formatBytes(value) : String(value));
       }
     }).catch(function () {});
   }
@@ -121,7 +135,7 @@ INDEX_PAGE_HTML = """<!DOCTYPE html>
   }
 
   function runSearch() {
-    var q = document.getElementById("query").value; var limit = document.getElementById("limit").value || "50";
+    var q = document.getElementById("query").value; var limit = document.getElementById("limit").value || "20";
     fetchJson("/api/search?q=" + encodeURIComponent(q) + "&limit=" + encodeURIComponent(limit)).then(function (payload) { renderResults(payload.results || []); }).catch(function () {});
   }
 
@@ -153,6 +167,10 @@ INDEX_PAGE_HTML = """<!DOCTYPE html>
 
   document.getElementById("search-form").addEventListener("submit", function (event) { event.preventDefault(); runSearch(); });
   document.getElementById("query").addEventListener("input", function () { clearTimeout(searchTimer); searchTimer = setTimeout(runSearch, 300); });
+  document.getElementById("stats-toggle").addEventListener("click", function () {
+    var more = document.getElementById("stats-more"); more.hidden = !more.hidden;
+    this.setAttribute("aria-expanded", String(!more.hidden)); this.textContent = more.hidden ? ">>" : "<<";
+  });
   document.getElementById("close-detail").addEventListener("click", function () { document.getElementById("detail").hidden = true; });
   refreshStats(); runSearch();
   setInterval(refreshStats, 2000);

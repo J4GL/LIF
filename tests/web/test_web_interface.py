@@ -1,4 +1,5 @@
 """Web category: HTTP routes, JSON shapes, headers and the page (F-005)."""
+import html.parser
 import json
 import threading
 import unittest
@@ -11,6 +12,41 @@ from tests.shared_fixtures import http_get
 HASH_A = b"\x0a" * 20
 HASH_B = b"\x0b" * 20
 HOSTILE = "<script>alert(1)</script>"
+
+
+class PageStructure(html.parser.HTMLParser):
+    """Element ids with their attributes, direct text, and the data-stat keys inside each id."""
+
+    def __init__(self, text):
+        super().__init__()
+        self.attributes, self.texts, self.stats, self.open = {}, {}, {}, []
+        self.feed(text)
+
+    def handle_starttag(self, tag, attrs):
+        values = dict(attrs)
+        if "data-stat" in values:
+            for element_id, _ in self.open:
+                self.stats.setdefault(element_id, []).append(values["data-stat"])
+        if tag in ("input", "meta", "br"):
+            if "id" in values:
+                self.attributes[values["id"]] = values
+            return
+        self.open.append((values.get("id"), tag))
+        if "id" in values:
+            self.attributes[values["id"]] = values
+
+    def handle_endtag(self, tag):
+        while self.open:
+            _, opened = self.open.pop()
+            if opened == tag:
+                break
+
+    def handle_data(self, data):
+        if self.open and self.open[-1][0] and data.strip():
+            self.texts[self.open[-1][0]] = self.texts.get(self.open[-1][0], "") + data.strip()
+
+    def stats_in(self, element_id):
+        return self.stats.get(element_id, [])
 
 
 class WebInterfaceTest(unittest.TestCase):
@@ -46,9 +82,26 @@ class WebInterfaceTest(unittest.TestCase):
 
     def test_RUNTIME_002_page_shows_pipeline_counters(self):
         _, body = self.get("/")
+        page = PageStructure(body.decode("utf-8"))
+        self.assertEqual(page.stats_in("stats-summary"), ["uptime_seconds", "torrents", "torrents_size"])
+        self.assertEqual((page.texts.get("stats-toggle"), page.attributes["stats-toggle"].get("aria-controls")), (">>", "stats-more"))
+        self.assertIn("hidden", page.attributes["stats-more"])
         keys = ("hashes_seen", "with_metadata", "fetch_connections", "fetch_attempts", "fetch_in_progress", "fetch_failed", "lookups_started", "samples_received", "packets_sent", "packets_received", "index_documents")
-        self.assertEqual([key for key in keys if ('data-stat="%s"' % key).encode() not in body], [])
+        self.assertEqual([key for key in keys if key not in page.stats_in("stats-more")], [])
         self.assertNotIn(b'data-stat="hashes_discovered"', body)
+        self.assertIn(b'key === "torrents_size" ? formatBytes(value)', body)
+        self.assertIn(b'key === "uptime_seconds" ? formatDuration(value)', body)
+
+    def test_RUNTIME_009_default_limit_20(self):
+        for number in range(25):
+            self.catalog.store_metadata(TorrentMetadata(bytes([0x40 + number]) * 20, "t%d" % number, 1, 16384, 1, [TorrentFile("t%d" % number, 1)], False, 1.0, None))
+        _, raw = self.get("/api/search?q=")
+        payload = json.loads(raw)
+        self.assertEqual((payload["limit"], len(payload["results"])), (20, 20))
+        _, body = self.get("/")
+        page = PageStructure(body.decode("utf-8"))
+        self.assertEqual(page.attributes["limit"].get("value"), "20")
+        self.assertIn(b'document.getElementById("limit").value || "20"', body)
 
     def test_RUNTIME_004_detail_panel_hides_peers(self):
         _, body = self.get("/")
@@ -105,10 +158,10 @@ class WebInterfaceTest(unittest.TestCase):
 
 class ParsingTest(unittest.TestCase):
     def test_parse_search_query_defaults_and_clamps(self):
-        self.assertEqual(parse_search_query(""), ("", 50))
+        self.assertEqual(parse_search_query(""), ("", 20))
         self.assertEqual(parse_search_query("q=+abc+&limit=3"), ("abc", 3))
         self.assertEqual(parse_search_query("limit=0"), ("", 1))
-        self.assertEqual(parse_search_query("limit=abc"), ("", 50))
+        self.assertEqual(parse_search_query("limit=abc"), ("", 20))
         self.assertEqual(len(parse_search_query("q=" + "x" * 500)[0]), 200)
 
     def test_parse_info_hash_hex(self):
