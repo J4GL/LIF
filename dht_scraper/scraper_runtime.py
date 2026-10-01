@@ -195,7 +195,7 @@ class ScraperRuntime:
         created = database.open_writer()
         self.database = database
         LOGGER.info("search database %s %s", "created" if created else "opened", self.settings.database_path)
-        self.catalog.enable_index_tracking()
+        self.catalog.enable_index_tracking(check_database=True)
         self.indexer = SearchIndexer(self.catalog, database, **self.indexer_options)
         self.indexer.start()
         assert self.indexer.thread is not None

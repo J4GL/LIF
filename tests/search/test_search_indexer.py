@@ -9,7 +9,7 @@ from dht_scraper.torrent_info_summary import TorrentFile, TorrentMetadata
 from tests.search.database_fixtures import FailingDatabase, document, info_hash_hex, open_database
 from tests.shared_fixtures import wait_until
 
-STAT_KEYS = ["index_backlog", "index_documents", "index_dropped", "index_errors", "index_updates", "index_upserts"]
+STAT_KEYS = ["index_backlog", "index_checked", "index_documents", "index_dropped", "index_errors", "index_known", "index_updates", "index_upserts"]
 FAST = {"document_seconds": 0.05, "counter_seconds": 0.05, "count_seconds": 0.05}
 
 
@@ -50,7 +50,9 @@ class SearchIndexerSpecTest(IndexerTestCase):
             self.assertEqual(row_a["name"], "old A")
             self.assertEqual((row_b["seen_count"], row_b["first_seen"]), (3, 100.0))
             self.assertEqual(indexer.snapshot_counts()["index_upserts"], 2)
-            self.assertEqual(self.catalog.torrent_detail(bytes.fromhex(info_hash_hex(1)))["seen_count"], 13)
+            detail = self.catalog.torrent_detail(bytes.fromhex(info_hash_hex(1)))
+            self.assertEqual((detail["seen_count"], detail["fetch_state"]), (13, "done"))
+            self.assertEqual(self.catalog.snapshot_counts()["metadata_in_memory"], 0)
         with self.subTest(case="30 files"):
             database = open_database(self)
             paths = ["f%02d.bin" % index for index in range(1, 31)]
@@ -81,7 +83,7 @@ class SearchIndexerSpecTest(IndexerTestCase):
         connection.commit()
         connection.close()
         self.catalog.record_hash(hash_a, SOURCE_SAMPLE, now=113.0)
-        self.assertTrue(wait_until(lambda: (database.get_document(info_hash_hex(1)) or {}).get("seen_count") == 4, timeout=2.0))
+        self.assertTrue(wait_until(lambda: self.catalog.torrent_detail(hash_a)["fetch_state"] == "pending", timeout=2.0))
 
     def test_SEARCH_004_failures_retry_with_backoff(self):
         database = FailingDatabase(open_database(self), failing=True)
@@ -142,6 +144,44 @@ class SearchIndexerSpecTest(IndexerTestCase):
         writer = open_database(self, path=database.path)
         writer.write_documents([document(number, "n%d" % number) for number in range(8, 11)])
         self.assertTrue(wait_until(lambda: indexer.snapshot_counts()["index_documents"] == 10, timeout=1.0))
+
+
+    def test_SEARCH_007_database_checks(self):
+        peer = ("1.2.3.4", 6881)
+        hash_k, hash_u, hash_v = (bytes.fromhex(info_hash_hex(number)) for number in (1, 2, 3))
+        catalog = TorrentCatalog()
+        catalog.enable_index_tracking(check_database=True)
+        self.catalog = catalog
+        database = FailingDatabase(open_database(self, [document(1, "Known", seen_count=7, announce_count=2, first_seen=3.0)]))
+        indexer = self.make_indexer(database, check_seconds=0.05, backoff_start=0.05, backoff_max=0.1, **FAST)
+        indexer.start()
+        fetched = []
+
+        def candidates():
+            found = [info_hash for info_hash, _ in catalog.next_fetch_candidates(10)]
+            for info_hash in found:
+                catalog.release_fetch_claim(info_hash)
+            fetched.extend(found)
+            return found
+
+        catalog.record_hash(hash_k, SOURCE_SAMPLE, peer)
+        catalog.record_hash(hash_u, SOURCE_SAMPLE, peer)
+        self.assertTrue(wait_until(lambda: catalog.pending_database_checks(10) == [], timeout=2.0))
+        detail = catalog.torrent_detail(hash_k)
+        self.assertEqual((detail["fetch_state"], detail["seen_count"]), ("done", 8))
+        self.assertEqual(candidates(), [hash_u])
+        self.assertNotIn(hash_k, fetched)
+        counts = indexer.snapshot_counts()
+        self.assertEqual((counts["index_checked"], counts["index_known"]), (2, 1))
+        database.failing = True
+        with self.assertLogs("dht_scraper", level="ERROR"):
+            catalog.record_hash(hash_v, SOURCE_SAMPLE, peer)
+            time.sleep(0.5)
+        self.assertEqual(catalog.pending_database_checks(10), [hash_v])
+        self.assertNotIn(hash_v, candidates())
+        self.assertGreaterEqual(indexer.snapshot_counts()["index_errors"], 1)
+        database.failing = False
+        self.assertTrue(wait_until(lambda: hash_v in candidates(), timeout=2.0))
 
 
 if __name__ == "__main__":

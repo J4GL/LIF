@@ -291,7 +291,8 @@ more hashes for about 20 % more traffic.
 
 - Inbound UDP is needed for the passive path (other nodes announcing to us).
 - Without `--database` everything is lost on exit, and the catalog is capped at 250 000 hashes.
-  With it, a torrent already in the database is fetched again when a new run sees it.
+  With it, metadata leaves memory once written to SQLite, and a hash already in the database is
+  recognized (one indexed lookup per new hash) and never fetched again.
 - `seen_count` is a rough popularity signal, not a swarm size.
 - Most peers cannot be reached: about 60 % of TCP connects time out (NAT, firewall, offline) and
   15 % are refused. About 6 % of connection attempts end with verified metadata.

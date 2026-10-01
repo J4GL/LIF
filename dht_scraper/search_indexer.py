@@ -13,6 +13,9 @@ LOGGER = logging.getLogger(LOGGER_NAME)
 DOCUMENT_SECONDS = 1.0
 COUNTER_SECONDS = 30.0
 COUNT_SECONDS = 10.0
+CHECK_SECONDS = 0.25
+CHECK_BATCH_SIZE = 500
+MAX_CHECK_BATCHES = 20
 BACKOFF_START_SECONDS = 1.0
 BACKOFF_MAX_SECONDS = 30.0
 FINAL_FLUSH_SECONDS = 3.0
@@ -71,18 +74,20 @@ class SearchIndexer:
         document_seconds: float = DOCUMENT_SECONDS,
         counter_seconds: float = COUNTER_SECONDS,
         count_seconds: float = COUNT_SECONDS,
+        check_seconds: float = CHECK_SECONDS,
         backoff_start: float = BACKOFF_START_SECONDS,
         backoff_max: float = BACKOFF_MAX_SECONDS,
         batch_size: int = BATCH_SIZE,
         final_flush_seconds: float = FINAL_FLUSH_SECONDS,
         clock: Clock = time.monotonic,
     ) -> None:
-        assert document_seconds > 0 and counter_seconds > 0 and count_seconds > 0 and 0 < backoff_start <= backoff_max and batch_size >= 1
+        assert document_seconds > 0 and counter_seconds > 0 and count_seconds > 0 and check_seconds > 0 and 0 < backoff_start <= backoff_max and batch_size >= 1
         self.catalog = catalog
         self.database = database
         self.document_seconds = document_seconds
         self.counter_seconds = counter_seconds
         self.count_seconds = count_seconds
+        self.check_seconds = check_seconds
         self.backoff_start = backoff_start
         self.backoff_max = backoff_max
         self.batch_size = batch_size
@@ -95,8 +100,10 @@ class SearchIndexer:
         self.upserts = 0
         self.updates = 0
         self.errors = 0
+        self.checked = 0
+        self.known = 0
         self.backoff = 0.0
-        self.next_documents = self.next_counters = self.next_count = self.wake_at = 0.0
+        self.next_checks = self.next_documents = self.next_counters = self.next_count = self.wake_at = 0.0
         assert self.thread is None
 
     # Parents: ScraperRuntime.start_indexer, tests
@@ -108,7 +115,7 @@ class SearchIndexer:
         except sqlite3.Error as error:
             self.record_error(error)
         now = self.clock()
-        self.next_documents, self.next_counters, self.next_count = now, now + self.counter_seconds, now + self.count_seconds
+        self.next_checks, self.next_documents, self.next_counters, self.next_count = now, now, now + self.counter_seconds, now + self.count_seconds
         self.thread = threading.Thread(target=self.run, name="index", daemon=True)
         self.thread.start()
         assert self.thread.is_alive()
@@ -145,6 +152,9 @@ class SearchIndexer:
     def run_due_work(self) -> None:
         now = self.clock()
         try:
+            if now >= self.next_checks:
+                self.flush_checks()
+                self.next_checks = now + self.check_seconds
             if now >= self.next_documents:
                 self.flush_documents()
                 self.next_documents = now + self.document_seconds
@@ -155,7 +165,7 @@ class SearchIndexer:
                 self.refresh_count()
                 self.next_count = now + self.count_seconds
             self.backoff = 0.0
-            self.wake_at = min(self.next_documents, self.next_counters, self.next_count)
+            self.wake_at = min(self.next_checks, self.next_documents, self.next_counters, self.next_count)
         except sqlite3.Error as error:
             self.record_error(error)
             self.backoff = self.backoff_start if self.backoff == 0.0 else min(2.0 * self.backoff, self.backoff_max)
@@ -189,10 +199,24 @@ class SearchIndexer:
                 self.catalog.requeue_index_documents(batch)
                 raise
             for snapshot, base in zip(batch, bases):
-                self.catalog.set_index_base(snapshot.info_hash, base)
+                self.catalog.mark_index_written(snapshot, base)
             with self.lock:
                 self.upserts += len(batch)
         assert deadline is not None
+
+    # Parents: run_due_work
+    # Keywords: database check, new hashes, known torrents, bounded batches
+    def flush_checks(self) -> None:
+        for _ in range(MAX_CHECK_BATCHES):
+            info_hashes = self.catalog.pending_database_checks(CHECK_BATCH_SIZE)
+            if not info_hashes:
+                return
+            found = self.database.lookup_counters([info_hash.hex() for info_hash in info_hashes])
+            self.catalog.apply_database_checks(info_hashes, {bytes.fromhex(info_hash): base for info_hash, base in found.items()})
+            with self.lock:
+                self.checked += len(info_hashes)
+                self.known += len(found)
+        assert self.checked >= 0
 
     # Parents: run_due_work, final_flush
     # Keywords: counters, update, missing row, resend in full
@@ -239,6 +263,8 @@ class SearchIndexer:
                 "index_errors": self.errors,
                 "index_backlog": backlog["documents"] + backlog["counters"],
                 "index_dropped": backlog["dropped"],
+                "index_checked": self.checked,
+                "index_known": self.known,
             }
             if self.documents is not None:
                 result["index_documents"] = self.documents

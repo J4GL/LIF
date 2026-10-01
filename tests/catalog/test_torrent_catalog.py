@@ -366,5 +366,74 @@ class CatalogIndexTrackingSpecTest(unittest.TestCase):
         self.assertEqual(counters(), [(13, 5, 50.0)] * 2)
 
 
+    def test_CATALOG_010_written_metadata_released(self):
+        peer = ("1.2.3.4", 6881)
+        with self.subTest(case="release"):
+            catalog = TorrentCatalog(max_entries=3)
+            catalog.enable_index_tracking()
+            catalog.record_hash(HASH_A, SOURCE_SAMPLE, peer, now=10.0)
+            catalog.store_metadata(make_metadata(HASH_A), now=20.0)
+            snapshot = catalog.drain_index_documents(10)[0]
+            catalog.mark_index_written(snapshot, (5, 1, 4.0))
+            counts = catalog.snapshot_counts()
+            self.assertEqual((counts["with_metadata"], counts["metadata_in_memory"], counts["fetch_done"]), (1, 0, 1))
+            detail = catalog.torrent_detail(HASH_A)
+            self.assertEqual((detail["fetch_state"], detail["metadata"], detail["peers"], detail["seen_count"]), ("done", None, [], 6))
+            self.assertEqual(catalog.search("", 10), [])
+            self.assertEqual(catalog.next_fetch_candidates(10), [])
+            catalog.record_hash(HASH_A, SOURCE_SAMPLE, now=30.0)
+            counters = catalog.drain_index_counters(10)
+            self.assertEqual([(item.info_hash, item.seen_count, item.base, item.metadata) for item in counters], [(HASH_A, 2, (5, 1, 4.0), None)])
+            for _ in range(3):
+                catalog.record_hash(HASH_B, SOURCE_SAMPLE, now=40.0)
+                catalog.record_hash(HASH_C, SOURCE_SAMPLE, now=40.0)
+            catalog.record_hash(HASH_D, SOURCE_SAMPLE, peer, now=50.0)
+            self.assertIsNone(catalog.torrent_detail(HASH_A))
+            self.assertIsNotNone(catalog.torrent_detail(HASH_D))
+        with self.subTest(case="newer metadata kept"):
+            catalog = TorrentCatalog()
+            catalog.enable_index_tracking()
+            catalog.store_metadata(make_metadata(HASH_E, "first"), now=10.0)
+            first = catalog.drain_index_documents(10)[0]
+            catalog.store_metadata(make_metadata(HASH_E, "second"), now=20.0)
+            catalog.mark_index_written(first, (0, 0, None))
+            self.assertEqual(catalog.torrent_detail(HASH_E)["metadata"]["name"], "second")
+            self.assertEqual([item.info_hash for item in catalog.drain_index_documents(10)], [HASH_E])
+
+    def test_CATALOG_011_database_check_gate(self):
+        peer = ("1.2.3.4", 6881)
+        with self.subTest(case="check"):
+            catalog = TorrentCatalog()
+            catalog.enable_index_tracking(check_database=True)
+            catalog.record_hash(HASH_A, SOURCE_SAMPLE, peer, now=10.0)
+            catalog.record_hash(HASH_B, SOURCE_SAMPLE, now=10.0)
+            catalog.record_hash(HASH_C, SOURCE_SAMPLE, now=10.0)
+            self.assertEqual(catalog.hashes_needing_peers(10), [])
+            self.assertEqual(catalog.next_fetch_candidates(10), [])
+            self.assertEqual(sorted(catalog.pending_database_checks(10)), [HASH_A, HASH_B, HASH_C])
+            catalog.apply_database_checks([HASH_A, HASH_B, HASH_C], {HASH_A: (7, 2, 3.0), HASH_B: (4, 0, 1.0)})
+            self.assertEqual(catalog.pending_database_checks(10), [])
+            for info_hash in (HASH_A, HASH_B):
+                detail = catalog.torrent_detail(info_hash)
+                self.assertEqual((detail["fetch_state"], detail["metadata"]), ("done", None))
+            self.assertEqual(catalog.torrent_detail(HASH_A)["seen_count"], 8)
+            self.assertEqual(catalog.hashes_needing_peers(10), [HASH_C])
+            self.assertEqual(catalog.next_fetch_candidates(10), [])
+            self.assertEqual(catalog.snapshot_counts()["with_metadata"], 2)
+            catalog.record_hash(HASH_A, SOURCE_SAMPLE, now=20.0)
+            drained = sorted((item.info_hash, item.seen_count, item.base) for item in catalog.drain_index_counters(10))
+            self.assertEqual(drained, [(HASH_A, 2, (7, 2, 3.0)), (HASH_B, 1, (4, 0, 1.0))])
+            catalog.reset_index_base(HASH_B)
+            self.assertEqual(catalog.torrent_detail(HASH_B)["fetch_state"], "pending")
+            self.assertEqual(catalog.hashes_needing_peers(10), [HASH_B])
+            self.assertEqual(catalog.pending_database_checks(10), [])
+        with self.subTest(case="no check"):
+            catalog = TorrentCatalog()
+            catalog.enable_index_tracking()
+            catalog.record_hash(HASH_D, SOURCE_SAMPLE, peer, now=10.0)
+            self.assertEqual(catalog.pending_database_checks(10), [])
+            self.assertEqual([info_hash for info_hash, _ in catalog.next_fetch_candidates(10)], [HASH_D])
+
+
 if __name__ == "__main__":
     unittest.main()

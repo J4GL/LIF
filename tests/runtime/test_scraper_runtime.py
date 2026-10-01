@@ -21,7 +21,7 @@ from tests.shared_fixtures import http_get_json, wait_until
 
 BOOTSTRAP = [("127.0.0.1", 1)]
 THREAD_NAMES = ("crawler", "fetch", "web", "index")
-FAST_INDEX = {"document_seconds": 0.1, "counter_seconds": 0.1, "count_seconds": 0.2}
+FAST_INDEX = {"document_seconds": 0.1, "counter_seconds": 0.1, "count_seconds": 0.2, "check_seconds": 0.05}
 
 
 def project_threads():
@@ -277,15 +277,25 @@ class ScraperRuntimeTest(unittest.TestCase):
             first.catalog.record_hash(info_hash, SOURCE_SAMPLE)
         finally:
             first.stop()
+        calls = []
+
+        async def counting_fetch(hash_value, peer):
+            calls.append(hash_value)
+            raise MetadataFetchError("connect")
+
         second_catalog = TorrentCatalog()
-        second = ScraperRuntime(settings(nodes=1, fetch_enabled=False, database_path=path), second_catalog, never_fetch, BOOTSTRAP, browser_opener=self.opened.append, indexer_options=FAST_INDEX)
+        second = ScraperRuntime(settings(nodes=1, database_path=path), second_catalog, counting_fetch, BOOTSTRAP, browser_opener=self.opened.append, indexer_options=FAST_INDEX)
         second.start()
         try:
             _, payload = self.get_json(second, "/api/search?q=persistent")
             self.assertEqual(payload["engine"], "sqlite")
             self.assertEqual([(record["info_hash"], record["seen_count"]) for record in payload["results"]], [(info_hash.hex(), 2)])
-            second_catalog.record_hash(info_hash, SOURCE_SAMPLE)
-            second_catalog.store_metadata(stored)
+            second_catalog.record_hash(info_hash, SOURCE_SAMPLE, ("127.0.0.1", 6881))
+            done = lambda: self.get_json(second, "/api/torrent/" + info_hash.hex())[1]
+            self.assertTrue(wait_until(lambda: done()["fetch_state"] == "done", timeout=2.0))
+            self.assertEqual(done()["metadata"]["name"], "Persistent One")
+            time.sleep(0.3)
+            self.assertEqual(calls, [])
         finally:
             second.stop()
         reader = TorrentDatabase(path)

@@ -1,6 +1,7 @@
 """Bounded in-memory catalog of observed torrents with fetch and lookup state. One lock, no I/O."""
 import collections
 import heapq
+import itertools
 import operator
 import threading
 import time
@@ -41,6 +42,7 @@ class TorrentEntry:
     __slots__ = (
         "info_hash", "first_seen", "last_seen", "seen_count", "announce_count", "peers", "failed_peers", "fetch_state",
         "fetch_attempts", "last_error", "lookups_started", "lookup_in_progress", "next_lookup_time", "metadata", "index_base",
+        "in_database", "database_checked",
     )
 
     # Parents: TorrentCatalog._get_or_create_locked
@@ -62,14 +64,16 @@ class TorrentEntry:
         self.next_lookup_time = 0.0
         self.metadata: Optional[TorrentMetadata] = None
         self.index_base: Optional[IndexBase] = None
+        self.in_database = False
+        self.database_checked = True
         assert self.fetch_state == FETCH_PENDING and self.metadata is None
 
 
 class IndexSnapshot(NamedTuple):
-    """Counters of one entry with metadata, copied under the catalog lock for the search indexer."""
+    """Counters of one entry with metadata or in the database, copied under the catalog lock for the search indexer."""
 
     info_hash: bytes
-    metadata: TorrentMetadata
+    metadata: Optional[TorrentMetadata]
     seen_count: int
     announce_count: int
     first_seen: float
@@ -95,7 +99,7 @@ def cumulative_counters(entry: TorrentEntry) -> Tuple[int, int, float]:
 # Parents: TorrentCatalog.drain_index_documents, TorrentCatalog.drain_index_counters
 # Keywords: index snapshot, copy, counters
 def index_snapshot(entry: TorrentEntry) -> IndexSnapshot:
-    assert entry.metadata is not None
+    assert entry.metadata is not None or entry.in_database
     result = IndexSnapshot(entry.info_hash, entry.metadata, entry.seen_count, entry.announce_count, entry.first_seen, entry.last_seen, entry.index_base, entry)
     assert result.info_hash == entry.info_hash
     return result
@@ -167,6 +171,8 @@ class TorrentCatalog:
         self._index_documents: "collections.OrderedDict[bytes, TorrentEntry]" = collections.OrderedDict()
         self._index_counters: Dict[bytes, TorrentEntry] = {}
         self._index_dropped = 0
+        self._check_database = False
+        self._needs_check: Dict[bytes, TorrentEntry] = {}
         self.max_entries = max_entries
         self.max_peers_per_hash = max_peers_per_hash
         self.max_fetch_attempts = max_fetch_attempts
@@ -358,7 +364,8 @@ class TorrentCatalog:
                 "hashes_seen": len(self._entries),
                 "hashes_discovered": self._discovered,
                 "observations": self._observations,
-                "with_metadata": len(self._fetched),
+                "with_metadata": self._state_counts[FETCH_DONE],
+                "metadata_in_memory": len(self._fetched),
                 "fetch_pending": self._state_counts[FETCH_PENDING],
                 "fetch_in_progress": self._state_counts[FETCH_IN_PROGRESS],
                 "fetch_done": self._state_counts[FETCH_DONE],
@@ -394,12 +401,13 @@ class TorrentCatalog:
         return result
 
     # Parents: ScraperRuntime.start_indexer, tests
-    # Keywords: search index, tracking, enable, bound
-    def enable_index_tracking(self, max_pending: int = MAX_INDEX_PENDING) -> None:
+    # Keywords: search index, tracking, enable, bound, database check
+    def enable_index_tracking(self, max_pending: int = MAX_INDEX_PENDING, check_database: bool = False) -> None:
         assert max_pending >= 1
         with self._lock:
             self._index_tracking = True
             self._index_max_pending = max_pending
+            self._check_database = check_database
         assert self._index_tracking
 
     # Parents: SearchIndexer.flush_documents
@@ -424,7 +432,8 @@ class TorrentCatalog:
                 info_hash = next(iter(self._index_counters))
                 entry = self._index_counters.pop(info_hash)
                 if entry.index_base is None:
-                    self._queue_document_locked(entry)
+                    if entry.metadata is not None:
+                        self._queue_document_locked(entry)
                 else:
                     result.append(index_snapshot(entry))
         assert len(result) <= limit
@@ -462,17 +471,72 @@ class TorrentCatalog:
                 entry.index_base = base
         assert base[0] >= 0
 
+    # Parents: SearchIndexer.flush_documents
+    # Keywords: search index, written, release metadata, base, memory
+    def mark_index_written(self, snapshot: IndexSnapshot, base: IndexBase) -> None:
+        assert snapshot.metadata is not None and len(base) == 3
+        with self._lock:
+            entry = self._entries.get(snapshot.info_hash)
+            if entry is snapshot.entry:
+                entry.index_base = base
+                if entry.metadata is snapshot.metadata:
+                    if self._index_documents.pop(entry.info_hash, None) is not None:
+                        self._index_counters.setdefault(entry.info_hash, entry)
+                    self._release_metadata_locked(entry)
+            self._assert_invariants_locked()
+        assert base[0] >= 0
+
+    # Parents: FetchEngine (via SearchIndexer.flush_checks)
+    # Keywords: database check, unchecked, pending, oldest first
+    def pending_database_checks(self, limit: int) -> List[bytes]:
+        assert limit >= 0
+        with self._lock:
+            result = list(itertools.islice(self._needs_check, limit))
+        assert len(result) <= limit
+        return result
+
+    # Parents: SearchIndexer.flush_checks
+    # Keywords: database check, known torrent, done without fetch, base
+    def apply_database_checks(self, info_hashes: Sequence[bytes], found: Dict[bytes, IndexBase]) -> None:
+        assert all(len(info_hash) == NODE_ID_LENGTH for info_hash in info_hashes)
+        with self._lock:
+            for info_hash in info_hashes:
+                entry = self._needs_check.pop(info_hash, None)
+                if entry is None or entry.database_checked:
+                    continue
+                entry.database_checked = True
+                base = found.get(info_hash)
+                if base is not None and entry.fetch_state == FETCH_PENDING:
+                    entry.index_base = base
+                    entry.in_database = True
+                    entry.peers = None
+                    entry.failed_peers = None
+                    self._set_state_locked(entry, FETCH_DONE)
+                    if self._index_tracking:
+                        self._index_counters.setdefault(info_hash, entry)
+                self._index_entry_locked(entry)
+            self._assert_invariants_locked()
+        assert all(info_hash not in self._needs_check for info_hash in info_hashes)
+
     # Parents: SearchIndexer.flush_counters
-    # Keywords: search index, missing document, resend in full
+    # Keywords: search index, missing document, resend in full, fetch again
     def reset_index_base(self, info_hash: bytes) -> None:
         assert len(info_hash) == NODE_ID_LENGTH
         with self._lock:
             entry = self._entries.get(info_hash)
-            if entry is not None and entry.metadata is not None:
+            if entry is not None:
                 entry.index_base = None
                 self._index_counters.pop(info_hash, None)
-                self._queue_document_locked(entry)
-        assert entry is None or entry.index_base is None or entry.metadata is None
+                if entry.metadata is not None:
+                    self._queue_document_locked(entry)
+                elif entry.in_database:
+                    entry.in_database = False
+                    entry.database_checked = True
+                    if entry.fetch_state == FETCH_DONE:
+                        self._set_state_locked(entry, FETCH_PENDING)
+                    self._index_entry_locked(entry)
+            self._assert_invariants_locked()
+        assert entry is None or entry.index_base is None
 
     # Parents: SearchIndexer.snapshot_counts
     # Keywords: search index, backlog, dropped, statistics
@@ -495,6 +559,17 @@ class TorrentCatalog:
                 self._index_dropped += 1
         assert entry.info_hash in self._index_documents or self._index_dropped > 0
 
+    # Parents: mark_index_written
+    # Keywords: release, metadata, peers, memory, in database
+    def _release_metadata_locked(self, entry: TorrentEntry) -> None:
+        assert self._lock.locked() and entry.fetch_state == FETCH_DONE
+        entry.metadata = None
+        entry.in_database = True
+        entry.peers = None
+        entry.failed_peers = None
+        self._fetched.pop(entry.info_hash, None)
+        assert entry.info_hash not in self._fetched
+
     # Parents: record_hash, record_hashes
     # Keywords: record, counters, peer, evict
     def _record_locked(self, info_hash: bytes, source: str, peer: Optional[Peer], moment: float) -> bool:
@@ -508,7 +583,7 @@ class TorrentCatalog:
             self._add_peer_locked(entry, peer)
         self._needs_lookup.pop(info_hash, None)
         self._index_entry_locked(entry)
-        if self._index_tracking and entry.metadata is not None:
+        if self._index_tracking and (entry.metadata is not None or entry.in_database):
             self._index_counters.setdefault(info_hash, entry)
         self._observations += 1
         if len(self._entries) > self.max_entries:
@@ -524,6 +599,7 @@ class TorrentCatalog:
         created = entry is None
         if entry is None:
             entry = TorrentEntry(info_hash, now)
+            entry.database_checked = not self._check_database
             self._entries[info_hash] = entry
             self._state_counts[FETCH_PENDING] += 1
             self._discovered += 1
@@ -568,15 +644,20 @@ class TorrentCatalog:
     def _index_entry_locked(self, entry: TorrentEntry) -> None:
         assert self._lock.locked()
         pending = entry.fetch_state == FETCH_PENDING
-        if pending and entry.peers:
+        if pending and not entry.database_checked:
+            self._needs_check.setdefault(entry.info_hash, entry)
+        else:
+            self._needs_check.pop(entry.info_hash, None)
+        ready = pending and entry.database_checked
+        if ready and entry.peers:
             self._fetchable[entry.info_hash] = entry
         else:
             self._fetchable.pop(entry.info_hash, None)
-        if pending and not entry.peers and not entry.lookup_in_progress and entry.lookups_started < self.max_lookups:
+        if ready and not entry.peers and not entry.lookup_in_progress and entry.lookups_started < self.max_lookups:
             self._needs_lookup.setdefault(entry.info_hash, entry)
         else:
             self._needs_lookup.pop(entry.info_hash, None)
-        assert (entry.info_hash in self._fetchable) == (pending and bool(entry.peers))
+        assert (entry.info_hash in self._fetchable) == (ready and bool(entry.peers))
 
     # Parents: _record_locked
     # Keywords: eviction, bounded, lowest value, oldest first, never claimed
@@ -598,6 +679,7 @@ class TorrentCatalog:
             self._fetched.pop(entry.info_hash, None)
             self._fetchable.pop(entry.info_hash, None)
             self._needs_lookup.pop(entry.info_hash, None)
+            self._needs_check.pop(entry.info_hash, None)
             self._index_counters.pop(entry.info_hash, None)
             self._state_counts[entry.fetch_state] -= 1
         self._evicted += len(victims)
@@ -654,7 +736,7 @@ class TorrentCatalog:
             "peers": [{"ip": ip, "port": port} for ip, port in (entry.peers or ())],
             "metadata": metadata_record,
         }
-        assert (result["metadata"] is None) == (entry.fetch_state != FETCH_DONE)
+        assert result["metadata"] is None or entry.fetch_state == FETCH_DONE
         return result
 
     # Parents: record_hash, record_hashes, add_lookup_result, next_fetch_candidates, store_metadata, mark_fetch_failed, release_fetch_claim
@@ -662,5 +744,5 @@ class TorrentCatalog:
     def _assert_invariants_locked(self) -> None:
         assert self._lock.locked()
         assert sum(self._state_counts.values()) == len(self._entries)
-        assert len(self._fetched) == self._state_counts[FETCH_DONE]
+        assert len(self._fetched) <= self._state_counts[FETCH_DONE]
         assert self._lookups_in_progress >= 0 and len(self._needs_lookup) + len(self._fetchable) <= len(self._entries)
