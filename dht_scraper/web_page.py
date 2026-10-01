@@ -52,6 +52,7 @@ INDEX_PAGE_HTML = """<!DOCTYPE html>
     <span>samples <b data-stat="samples_received">0</b></span>
     <span>sent <b data-stat="packets_sent">0</b></span>
     <span>received <b data-stat="packets_received">0</b></span>
+    <span>in database <b data-stat="index_documents">-</b></span>
   </div>
 </header>
 <main>

@@ -46,7 +46,7 @@ class WebInterfaceTest(unittest.TestCase):
 
     def test_RUNTIME_002_page_shows_pipeline_counters(self):
         _, body = self.get("/")
-        keys = ("hashes_seen", "with_metadata", "fetch_connections", "fetch_attempts", "fetch_in_progress", "fetch_failed", "lookups_started", "samples_received", "packets_sent", "packets_received")
+        keys = ("hashes_seen", "with_metadata", "fetch_connections", "fetch_attempts", "fetch_in_progress", "fetch_failed", "lookups_started", "samples_received", "packets_sent", "packets_received", "index_documents")
         self.assertEqual([key for key in keys if ('data-stat="%s"' % key).encode() not in body], [])
         self.assertNotIn(b'data-stat="hashes_discovered"', body)
 
@@ -79,7 +79,12 @@ class WebInterfaceTest(unittest.TestCase):
         import socket
         raw = socket.create_connection(("127.0.0.1", self.server.server_address[1]), timeout=2.0)
         raw.sendall(b"GET / FOO/1.1\r\n\r\n")
-        reply = raw.recv(4096)
+        reply = b""
+        while True:
+            chunk = raw.recv(4096)
+            if not chunk:
+                break
+            reply += chunk
         raw.close()
         self.assertIn(b"Error code: 400", reply)
 

@@ -6,7 +6,9 @@ nodes for hash samples (BEP 51), downloads torrent **metadata only** from peers 
 BEP 10, over TCP, with message stream encryption or uTP when a peer needs it) and shows
 everything in a small web page. The IPv6 DHT (BEP 32) is available with `--ipv6`.
 
-Nothing is written to disk. The catalog lives in memory and disappears when the process ends.
+By default nothing is written to disk: the catalog lives in memory and disappears when the process
+ends. With `--database FILE` (always on in Docker), every torrent with metadata is also kept in an
+SQLite file that answers the searches, tolerates typos and survives restarts.
 
 > **Ethics and scope.** This tool observes public DHT traffic and downloads only the torrent
 > *info dictionary* (name, size, file list). It never sends `interested` or `request` messages,
@@ -32,8 +34,10 @@ Nothing is written to disk. The catalog lives in memory and disappears when the 
 - Retries with message stream encryption (RC4) a peer that closes on the plaintext handshake,
   and tries uTP (BEP 29) on a peer that refuses TCP.
 - Serves a web page with live stats, search and a detail view, and opens it in your browser.
+- With `--database`, keeps torrents with metadata in SQLite (FTS5) and searches them with one typo
+  allowed per word of 4 letters or more (`debain` finds `Debian`).
 
-What it deliberately does not do: persist anything, download content, store DHT items (BEP 44),
+What it deliberately does not do: persist hashes without metadata, download content, store DHT items (BEP 44),
 authenticate the web page.
 
 ## Requirements
@@ -65,6 +69,22 @@ Also crawl the IPv6 DHT (more hashes, about 20 % more UDP traffic):
 python3 -m dht_scraper --ipv6
 ```
 
+## Docker
+
+Three scripts run the scraper in Docker (Docker with the compose plugin, bash and git needed). The
+SQLite database lives in the Docker volume `dht-scraper-data` and is kept by every script.
+
+| Script | What it does |
+|---|---|
+| `scripts/run.sh` | Builds and runs the scraper in this terminal. Ctrl-C, closing the terminal or killing the script stops and removes the container |
+| `scripts/install-service.sh` | Installs the service: the container restarts with Docker, and cron runs `scripts/update.sh` every day at 04:17 |
+| `scripts/install-service.sh --uninstall` | Removes the container and the cron line, keeps the database |
+| `scripts/update.sh` | Fetches the git remote (GitHub) first and does nothing when there is no new commit. Otherwise it fast-forwards the checkout, builds the new image while the old container still runs, then replaces the container; a failure puts the previous version back |
+
+The web page is published on `http://localhost:8080/` and on the local network; set
+`DHT_WEB_BIND=127.0.0.1` or `DHT_WEB_PORT` in `.env` to change it. Logs:
+`docker compose -p dht-scraper logs -f scraper`.
+
 ## Command line
 
 | Option | Default | Meaning |
@@ -78,6 +98,7 @@ python3 -m dht_scraper --ipv6
 | `--batch-size` | 6 | Crawl queries per node per interval |
 | `--interval` | 0.1 | Seconds between crawl batches |
 | `--ipv6` | off | Also run the nodes on the IPv6 DHT (BEP 32), with the same ids |
+| `--database` | `$DHT_DATABASE` | SQLite file for torrents with metadata and typo-tolerant search; none = memory only |
 | `--log-file` | none | Also write the log to this file |
 | `--verbose` | off | DEBUG logging: every hash, every web request |
 | `--no-fetch` | off | Crawl only |
@@ -269,7 +290,8 @@ more hashes for about 20 % more traffic.
 ## Limitations
 
 - Inbound UDP is needed for the passive path (other nodes announcing to us).
-- Everything is lost on exit, and the catalog is capped at 250 000 hashes.
+- Without `--database` everything is lost on exit, and the catalog is capped at 250 000 hashes.
+  With it, a torrent already in the database is fetched again when a new run sees it.
 - `seen_count` is a rough popularity signal, not a swarm size.
 - Most peers cannot be reached: about 60 % of TCP connects time out (NAT, firewall, offline) and
   15 % are refused. About 6 % of connection attempts end with verified metadata.
@@ -291,9 +313,13 @@ more hashes for about 20 % more traffic.
 | web | `python3 -m unittest discover -s tests/web -t .` |
 | runtime | `python3 -m unittest discover -s tests/runtime -t .` |
 | cli | `python3 -m unittest discover -s tests/cli -t .` |
+| search | `python3 -m unittest discover -s tests/search -t .` |
+| scripts | `python3 -m unittest discover -s tests/scripts -t .` |
+| deploy | `DHT_DEPLOY_TESTS=1 python3 -m unittest discover -s tests/deploy -t .` |
 
-All tests run offline with fake sockets, loopback sockets on port 0 (IPv4 and `::1`), and fake
-peers for TCP, MSE and uTP. Test methods carry the ID of the spec they check, for example
+All tests except `deploy` run offline with fake sockets, loopback sockets on port 0 (IPv4 and
+`::1`), fake peers for TCP, MSE and uTP, temporary SQLite files and fake `docker` and `crontab`
+commands. The `deploy` tests need Docker and the network. Test methods carry the ID of the spec they check, for example
 `test_LOOKUP_001_...`.
 
 ## Code layout
@@ -313,6 +339,8 @@ peers for TCP, MSE and uTP. Test methods carry the ID of the spec they check, fo
 | `fetch_engine.py` | the fetch thread: asyncio loop, connection slots, jobs, reachability cache |
 | `torrent_info_summary.py` | info dict to a small metadata record |
 | `torrent_catalog.py` | bounded in-memory catalog, ranking, fetch and lookup state, search |
+| `torrent_database.py` | SQLite database: schema, FTS5 index, typo index, queries |
+| `search_indexer.py` | index thread: copies torrents with metadata and their counters to SQLite |
 | `bounded_recent_map.py` | insertion-ordered mapping with a size cap |
 | `magnet_link.py`, `web_page.py`, `web_interface.py` | magnet links, the page, the HTTP API |
 | `scraper_runtime.py` | thread wiring, stats, browser launch, shutdown |

@@ -1,0 +1,5 @@
+# Allow list: only the package goes to the Docker daemon (never .env).
+*
+!dht_scraper/
+**/__pycache__
+**/*.pyc

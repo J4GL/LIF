@@ -4,7 +4,7 @@ import heapq
 import operator
 import threading
 import time
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
+from typing import Any, Dict, Iterable, List, NamedTuple, Optional, Sequence, Set, Tuple
 
 from dht_scraper.bounded_recent_map import remember
 from dht_scraper.node_identity import NODE_ID_LENGTH
@@ -16,6 +16,7 @@ MAX_FETCH_ATTEMPTS = 3
 MAX_LOOKUPS_PER_HASH = 2
 LOOKUP_RETRY_SECONDS = 30.0
 EVICTION_DIVISOR = 20
+MAX_INDEX_PENDING = 100000
 
 FETCH_PENDING = "pending"
 FETCH_IN_PROGRESS = "in_progress"
@@ -31,6 +32,7 @@ VALID_SOURCES = (SOURCE_GET_PEERS, SOURCE_ANNOUNCE_PEER, SOURCE_SAMPLE)
 Peer = Tuple[str, int]
 FetchCandidate = Tuple[bytes, List[Peer]]
 RANK_ATTRIBUTES = operator.attrgetter("seen_count", "last_seen")
+IndexBase = Tuple[int, int, Optional[float]]
 
 
 class TorrentEntry:
@@ -38,7 +40,7 @@ class TorrentEntry:
 
     __slots__ = (
         "info_hash", "first_seen", "last_seen", "seen_count", "announce_count", "peers", "failed_peers", "fetch_state",
-        "fetch_attempts", "last_error", "lookups_started", "lookup_in_progress", "next_lookup_time", "metadata",
+        "fetch_attempts", "last_error", "lookups_started", "lookup_in_progress", "next_lookup_time", "metadata", "index_base",
     )
 
     # Parents: TorrentCatalog._get_or_create_locked
@@ -59,7 +61,44 @@ class TorrentEntry:
         self.lookup_in_progress = False
         self.next_lookup_time = 0.0
         self.metadata: Optional[TorrentMetadata] = None
+        self.index_base: Optional[IndexBase] = None
         assert self.fetch_state == FETCH_PENDING and self.metadata is None
+
+
+class IndexSnapshot(NamedTuple):
+    """Counters of one entry with metadata, copied under the catalog lock for the search indexer."""
+
+    info_hash: bytes
+    metadata: TorrentMetadata
+    seen_count: int
+    announce_count: int
+    first_seen: float
+    last_seen: float
+    base: Optional[IndexBase]
+    entry: TorrentEntry
+
+
+# Parents: TorrentCatalog._search_record_locked, TorrentCatalog._detail_record_locked
+# Keywords: index base, cumulative counters, previous runs
+def cumulative_counters(entry: TorrentEntry) -> Tuple[int, int, float]:
+    assert isinstance(entry, TorrentEntry)
+    base = entry.index_base
+    if base is None:
+        result = (entry.seen_count, entry.announce_count, entry.first_seen)
+    else:
+        first_seen = entry.first_seen if base[2] is None else min(base[2], entry.first_seen)
+        result = (base[0] + entry.seen_count, base[1] + entry.announce_count, first_seen)
+    assert result[0] >= entry.seen_count
+    return result
+
+
+# Parents: TorrentCatalog.drain_index_documents, TorrentCatalog.drain_index_counters
+# Keywords: index snapshot, copy, counters
+def index_snapshot(entry: TorrentEntry) -> IndexSnapshot:
+    assert entry.metadata is not None
+    result = IndexSnapshot(entry.info_hash, entry.metadata, entry.seen_count, entry.announce_count, entry.first_seen, entry.last_seen, entry.index_base, entry)
+    assert result.info_hash == entry.info_hash
+    return result
 
 
 # Parents: TorrentCatalog.search
@@ -123,6 +162,11 @@ class TorrentCatalog:
         self._discovered = 0
         self._evicted = 0
         self._lookups_in_progress = 0
+        self._index_tracking = False
+        self._index_max_pending = MAX_INDEX_PENDING
+        self._index_documents: "collections.OrderedDict[bytes, TorrentEntry]" = collections.OrderedDict()
+        self._index_counters: Dict[bytes, TorrentEntry] = {}
+        self._index_dropped = 0
         self.max_entries = max_entries
         self.max_peers_per_hash = max_peers_per_hash
         self.max_fetch_attempts = max_fetch_attempts
@@ -258,6 +302,8 @@ class TorrentCatalog:
             self._set_state_locked(entry, FETCH_DONE)
             self._fetched[entry.info_hash] = entry
             self._index_entry_locked(entry)
+            if self._index_tracking:
+                self._queue_document_locked(entry)
             self._assert_invariants_locked()
         assert isinstance(created, bool)
         return created
@@ -347,6 +393,108 @@ class TorrentCatalog:
         assert result is None or result["info_hash"] == info_hash.hex()
         return result
 
+    # Parents: ScraperRuntime.start_indexer, tests
+    # Keywords: search index, tracking, enable, bound
+    def enable_index_tracking(self, max_pending: int = MAX_INDEX_PENDING) -> None:
+        assert max_pending >= 1
+        with self._lock:
+            self._index_tracking = True
+            self._index_max_pending = max_pending
+        assert self._index_tracking
+
+    # Parents: SearchIndexer.flush_documents
+    # Keywords: search index, full documents, drain, fifo
+    def drain_index_documents(self, limit: int) -> List[IndexSnapshot]:
+        assert limit >= 0
+        with self._lock:
+            result: List[IndexSnapshot] = []
+            while self._index_documents and len(result) < limit:
+                _, entry = self._index_documents.popitem(last=False)
+                result.append(index_snapshot(entry))
+        assert len(result) <= limit
+        return result
+
+    # Parents: SearchIndexer.flush_counters
+    # Keywords: search index, counter updates, drain, no base resent in full
+    def drain_index_counters(self, limit: int) -> List[IndexSnapshot]:
+        assert limit >= 0
+        with self._lock:
+            result: List[IndexSnapshot] = []
+            while self._index_counters and len(result) < limit:
+                info_hash = next(iter(self._index_counters))
+                entry = self._index_counters.pop(info_hash)
+                if entry.index_base is None:
+                    self._queue_document_locked(entry)
+                else:
+                    result.append(index_snapshot(entry))
+        assert len(result) <= limit
+        return result
+
+    # Parents: SearchIndexer.flush_documents
+    # Keywords: search index, failure, requeue, front
+    def requeue_index_documents(self, snapshots: Sequence[IndexSnapshot]) -> None:
+        assert all(isinstance(snapshot, IndexSnapshot) for snapshot in snapshots)
+        with self._lock:
+            for snapshot in reversed(snapshots):
+                if snapshot.info_hash not in self._index_documents:
+                    self._index_documents[snapshot.info_hash] = snapshot.entry
+                    self._index_documents.move_to_end(snapshot.info_hash, last=False)
+            requeued = all(snapshot.info_hash in self._index_documents for snapshot in snapshots)
+        assert requeued
+
+    # Parents: SearchIndexer.flush_counters
+    # Keywords: search index, failure, requeue, counters
+    def requeue_index_counters(self, snapshots: Sequence[IndexSnapshot]) -> None:
+        assert all(isinstance(snapshot, IndexSnapshot) for snapshot in snapshots)
+        with self._lock:
+            for snapshot in snapshots:
+                if self._entries.get(snapshot.info_hash) is snapshot.entry:
+                    self._index_counters.setdefault(snapshot.info_hash, snapshot.entry)
+        assert len(self._index_counters) <= len(self._entries)
+
+    # Parents: SearchIndexer.flush_documents
+    # Keywords: search index, base, previous runs, written
+    def set_index_base(self, info_hash: bytes, base: IndexBase) -> None:
+        assert len(info_hash) == NODE_ID_LENGTH and len(base) == 3
+        with self._lock:
+            entry = self._entries.get(info_hash)
+            if entry is not None:
+                entry.index_base = base
+        assert base[0] >= 0
+
+    # Parents: SearchIndexer.flush_counters
+    # Keywords: search index, missing document, resend in full
+    def reset_index_base(self, info_hash: bytes) -> None:
+        assert len(info_hash) == NODE_ID_LENGTH
+        with self._lock:
+            entry = self._entries.get(info_hash)
+            if entry is not None and entry.metadata is not None:
+                entry.index_base = None
+                self._index_counters.pop(info_hash, None)
+                self._queue_document_locked(entry)
+        assert entry is None or entry.index_base is None or entry.metadata is None
+
+    # Parents: SearchIndexer.snapshot_counts
+    # Keywords: search index, backlog, dropped, statistics
+    def index_backlog(self) -> Dict[str, int]:
+        assert self._index_max_pending >= 1
+        with self._lock:
+            result = {"documents": len(self._index_documents), "counters": len(self._index_counters), "dropped": self._index_dropped}
+        assert result["dropped"] >= 0
+        return result
+
+    # Parents: store_metadata, drain_index_counters, reset_index_base
+    # Keywords: search index, document queue, bounded, drop oldest
+    def _queue_document_locked(self, entry: TorrentEntry) -> None:
+        assert self._lock.locked() and entry.metadata is not None
+        self._index_counters.pop(entry.info_hash, None)
+        if entry.info_hash not in self._index_documents:
+            self._index_documents[entry.info_hash] = entry
+            if len(self._index_documents) > self._index_max_pending:
+                self._index_documents.popitem(last=False)
+                self._index_dropped += 1
+        assert entry.info_hash in self._index_documents or self._index_dropped > 0
+
     # Parents: record_hash, record_hashes
     # Keywords: record, counters, peer, evict
     def _record_locked(self, info_hash: bytes, source: str, peer: Optional[Peer], moment: float) -> bool:
@@ -360,6 +508,8 @@ class TorrentCatalog:
             self._add_peer_locked(entry, peer)
         self._needs_lookup.pop(info_hash, None)
         self._index_entry_locked(entry)
+        if self._index_tracking and entry.metadata is not None:
+            self._index_counters.setdefault(info_hash, entry)
         self._observations += 1
         if len(self._entries) > self.max_entries:
             self._evict_locked()
@@ -448,6 +598,7 @@ class TorrentCatalog:
             self._fetched.pop(entry.info_hash, None)
             self._fetchable.pop(entry.info_hash, None)
             self._needs_lookup.pop(entry.info_hash, None)
+            self._index_counters.pop(entry.info_hash, None)
             self._state_counts[entry.fetch_state] -= 1
         self._evicted += len(victims)
         assert len(victims) <= wanted
@@ -458,14 +609,15 @@ class TorrentCatalog:
     def _search_record_locked(self, entry: TorrentEntry) -> Dict[str, Any]:
         assert self._lock.locked() and entry.metadata is not None
         metadata = entry.metadata
+        seen_count, announce_count, first_seen = cumulative_counters(entry)
         result = {
             "info_hash": entry.info_hash.hex(),
             "name": metadata.name,
             "size": metadata.total_size,
             "file_count": metadata.file_count,
-            "seen_count": entry.seen_count,
-            "announce_count": entry.announce_count,
-            "first_seen": entry.first_seen,
+            "seen_count": seen_count,
+            "announce_count": announce_count,
+            "first_seen": first_seen,
             "last_seen": entry.last_seen,
         }
         assert result["info_hash"] == entry.info_hash.hex()
@@ -488,11 +640,12 @@ class TorrentCatalog:
                 "fetched_at": metadata.fetched_at,
                 "source_peer": None if metadata.source_peer is None else {"ip": metadata.source_peer[0], "port": metadata.source_peer[1]},
             }
+        seen_count, announce_count, first_seen = cumulative_counters(entry)
         result = {
             "info_hash": entry.info_hash.hex(),
-            "seen_count": entry.seen_count,
-            "announce_count": entry.announce_count,
-            "first_seen": entry.first_seen,
+            "seen_count": seen_count,
+            "announce_count": announce_count,
+            "first_seen": first_seen,
             "last_seen": entry.last_seen,
             "fetch_state": entry.fetch_state,
             "fetch_attempts": entry.fetch_attempts,

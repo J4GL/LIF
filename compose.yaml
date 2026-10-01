@@ -1,0 +1,36 @@
+# DHT scraper with its SQLite search database in the volume <project>-data.
+# Use scripts/run.sh (temporary run) or scripts/install-service.sh (service with daily updates).
+# Local settings go in .env and compose.override.yaml, both ignored by git.
+name: ${DHT_PROJECT:-dht-scraper}
+
+services:
+  scraper:
+    build:
+      context: .
+      args:
+        REVISION: ${DHT_REVISION:-unknown}
+    image: ${DHT_IMAGE:-dht-scraper:local}
+    volumes:
+      - data:/data
+    ports:
+      - "${DHT_WEB_BIND:-0.0.0.0}:${DHT_WEB_PORT:-8080}:8080"
+      # The DHT needs the same port on both sides: other nodes answer the port they see.
+      - "6881-6888:6881-6888/udp"
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
+    init: true
+    restart: ${DHT_RESTART:-unless-stopped}
+    stop_grace_period: 30s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  data:
+    # Created by the scripts; `docker compose down -v` never deletes the database.
+    external: true
+    name: ${DHT_PROJECT:-dht-scraper}-data

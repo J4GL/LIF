@@ -1,0 +1,7 @@
+# Test overlay for the deploy tests (COMPOSE_FILE=compose.yaml:tests/deploy/compose.test.yaml):
+# a random loopback web port and a quiet scraper.
+services:
+  scraper:
+    ports: !override
+      - "127.0.0.1::8080"
+    command: ["--nodes", "1", "--batch-size", "1", "--interval", "1", "--no-fetch"]

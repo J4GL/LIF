@@ -1,6 +1,8 @@
 """Wires the crawler, the fetch engine and the web server together and owns shutdown."""
 import logging
 import math
+import os
+import signal
 import socket
 import threading
 import time
@@ -11,7 +13,9 @@ from dht_scraper.dht_crawler import DhtCrawler
 from dht_scraper.dht_node_sockets import MAX_NODES, NodeSocket, close_node_sockets, create_node_sockets
 from dht_scraper.event_log import LOGGER_NAME
 from dht_scraper.fetch_engine import DEFAULT_MAX_CONNECTIONS, FILE_LIMIT_MARGIN, MAX_CONNECTIONS_LIMIT, FetchEngine, FetchFunction, UtpFunction, raise_open_file_limit
+from dht_scraper.search_indexer import FINAL_FLUSH_SECONDS, SearchIndexer
 from dht_scraper.torrent_catalog import TorrentCatalog
+from dht_scraper.torrent_database import WRITE_TIMEOUT_SECONDS, TorrentDatabase
 from dht_scraper.web_interface import DEFAULT_WEB_HOST, DEFAULT_WEB_PORT, CatalogWebServer, create_web_server, serve_web_server, web_url
 
 LOGGER = logging.getLogger(LOGGER_NAME)
@@ -22,7 +26,8 @@ DEFAULT_INTERVAL = 0.1
 THREAD_JOIN_TIMEOUT_SECONDS = 5.0
 WAIT_POLL_SECONDS = 0.5
 SUMMARY_INTERVAL_SECONDS = 10.0
-STOP_REASONS = ("duration", "interrupt", "thread_failure")
+INDEX_JOIN_TIMEOUT_SECONDS = WRITE_TIMEOUT_SECONDS + FINAL_FLUSH_SECONDS + 1.0
+STOP_REASONS = ("duration", "interrupt", "terminate", "thread_failure")
 SocketFactory = Callable[[int, int], List[NodeSocket]]
 BrowserOpener = Callable[[str], Any]
 
@@ -54,10 +59,27 @@ def settings_error(port: int, nodes: int, web_host: str, web_port: int, duration
     return result
 
 
+# Parents: RuntimeSettings.__init__, parse_arguments
+# Keywords: database path, directory, validation
+def database_error(path: str) -> Optional[str]:
+    assert isinstance(path, str)
+    directory = os.path.dirname(os.path.abspath(path)) if path else ""
+    result: Optional[str] = None
+    if not path:
+        result = "--database must not be empty"
+    elif not os.path.isdir(directory):
+        result = "--database directory %s does not exist" % directory
+    assert result is None or result.startswith("--")
+    return result
+
+
 class RuntimeSettings:
     """Validated run settings."""
 
-    __slots__ = ("port", "nodes", "web_host", "web_port", "duration", "fetch_workers", "batch_size", "interval", "fetch_enabled", "open_browser", "ipv6_enabled")
+    __slots__ = (
+        "port", "nodes", "web_host", "web_port", "duration", "fetch_workers", "batch_size", "interval", "fetch_enabled", "open_browser", "ipv6_enabled",
+        "database_path",
+    )
 
     # Parents: build_settings, tests
     # Keywords: settings, validation, defaults
@@ -74,8 +96,10 @@ class RuntimeSettings:
         fetch_enabled: bool = True,
         open_browser: bool = True,
         ipv6_enabled: bool = False,
+        database_path: Optional[str] = None,
     ) -> None:
         assert settings_error(port, nodes, web_host, web_port, duration, fetch_workers, batch_size, interval) is None
+        assert database_path is None or database_error(database_path) is None
         self.port = port
         self.nodes = nodes
         self.web_host = web_host
@@ -87,6 +111,7 @@ class RuntimeSettings:
         self.fetch_enabled = fetch_enabled
         self.open_browser = open_browser
         self.ipv6_enabled = ipv6_enabled
+        self.database_path = database_path
         assert self.nodes >= 1
 
 
@@ -105,6 +130,7 @@ class ScraperRuntime:
         browser_opener: BrowserOpener = webbrowser.open,
         retry_function: Optional[FetchFunction] = None,
         utp_function: Optional[UtpFunction] = None,
+        indexer_options: Optional[Dict[str, float]] = None,
     ) -> None:
         assert isinstance(settings, RuntimeSettings) and len(bootstrap_nodes) > 0
         self.settings = settings
@@ -122,6 +148,10 @@ class ScraperRuntime:
         self.fetch_engine: Optional[FetchEngine] = None
         self.web_server: Optional[CatalogWebServer] = None
         self.web_thread: Optional[threading.Thread] = None
+        self.indexer_options = dict(indexer_options or {})
+        self.indexer: Optional[SearchIndexer] = None
+        self.database: Optional[TorrentDatabase] = None
+        self.terminate_requested = False
         self.start_time = time.monotonic()
         self.last_summary_time = self.start_time
         self.stopped = False
@@ -150,10 +180,25 @@ class ScraperRuntime:
     # Keywords: web server, thread, bind first
     def start_web(self) -> None:
         assert self.web_server is None
-        self.web_server = create_web_server(self.settings.web_host, self.settings.web_port, self.catalog, self.snapshot_stats)
+        self.web_server = create_web_server(self.settings.web_host, self.settings.web_port, self.catalog, self.snapshot_stats, self.database)
         self.web_thread = threading.Thread(target=serve_web_server, args=(self.web_server,), name="web", daemon=True)
         self.web_thread.start()
         assert self.web_thread.is_alive()
+
+    # Parents: start
+    # Keywords: search database, open before serving, tracking, index thread
+    def start_indexer(self) -> None:
+        assert self.indexer is None and self.database is None
+        if self.settings.database_path is None:
+            return
+        database = TorrentDatabase(self.settings.database_path)
+        created = database.open_writer()
+        self.database = database
+        LOGGER.info("search database %s %s", "created" if created else "opened", self.settings.database_path)
+        self.catalog.enable_index_tracking()
+        self.indexer = SearchIndexer(self.catalog, database, **self.indexer_options)
+        self.indexer.start()
+        assert self.indexer.thread is not None
 
     # Parents: start
     # Keywords: fetch engine, open file limit, fetch enabled
@@ -215,6 +260,7 @@ class ScraperRuntime:
         try:
             self.open_sockets()
             self.create_crawler()
+            self.start_indexer()
             self.start_web()
             self.start_fetching()
             self.start_crawler()
@@ -237,6 +283,9 @@ class ScraperRuntime:
                     break
                 if time.monotonic() - self.last_summary_time >= SUMMARY_INTERVAL_SECONDS:
                     self.log_summary()
+            if self.terminate_requested:
+                LOGGER.info("terminated by signal")
+                reason = "terminate"
         except KeyboardInterrupt:
             LOGGER.info("interrupted by user")
             reason = "interrupt"
@@ -261,6 +310,14 @@ class ScraperRuntime:
             self.fetch_engine.join(THREAD_JOIN_TIMEOUT_SECONDS)
         if self.crawler_thread is not None:
             self.crawler_thread.join(THREAD_JOIN_TIMEOUT_SECONDS)
+        if self.indexer is not None:
+            self.indexer.stop()
+            if not self.indexer.join(INDEX_JOIN_TIMEOUT_SECONDS):
+                LOGGER.warning("index thread still running; leaving the database open")
+            elif self.database is not None:
+                self.database.close()
+        elif self.database is not None:
+            self.database.close()
         if self.crawler_thread is not None and self.crawler_thread.is_alive():
             LOGGER.warning("crawler thread still running (blocked in DNS?); leaving its sockets open")
         else:
@@ -280,6 +337,8 @@ class ScraperRuntime:
         stats.update(self.catalog.snapshot_counts())
         if self.fetch_engine is not None:
             stats.update(self.fetch_engine.snapshot_counts())
+        if self.indexer is not None:
+            stats.update(self.indexer.snapshot_counts())
         assert "hashes_seen" in stats and "uptime_seconds" in stats
         return stats
 
@@ -297,13 +356,28 @@ class ScraperRuntime:
         self.last_summary_time = time.monotonic()
         assert self.last_summary_time >= self.start_time
 
+    # Parents: run (SIGTERM handler)
+    # Keywords: signal, terminate, docker stop, idempotent
+    def on_terminate(self, signum: int, frame: Any) -> None:
+        assert signum == signal.SIGTERM
+        if not self.stopped:
+            self.terminate_requested = True
+            self.stop_event.set()
+        assert self.stop_event.is_set() or self.stopped
+
     # Parents: run_scraper
     # Keywords: run, start, wait, stop
     def run(self, duration: Optional[float]) -> Dict[str, Any]:
         assert duration is None or duration >= 0
-        self.start()
-        reason = self.wait_until_stopped(duration)
-        self.stop()
+        in_main_thread = threading.current_thread() is threading.main_thread()
+        previous = signal.signal(signal.SIGTERM, self.on_terminate) if in_main_thread else None
+        try:
+            self.start()
+            reason = self.wait_until_stopped(duration)
+            self.stop()
+        finally:
+            if in_main_thread:
+                signal.signal(signal.SIGTERM, previous)
         stats = self.snapshot_stats()
         LOGGER.info("finished: reason=%s hashes=%d metadata=%d", reason, stats["hashes_seen"], stats["with_metadata"])
         assert self.stopped

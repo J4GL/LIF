@@ -1,0 +1,184 @@
+#!/usr/bin/env python3
+"""Fake docker CLI for the script tests: the subset the scripts call, state in a JSON file.
+
+The configuration (state, call log) is read from fake-config.json next to this file, so the fake
+also works under `env -i`. Every call is appended to the call log with DHT_REVISION and DHT_RESTART.
+"""
+import contextlib
+import fcntl
+import json
+import os
+import sys
+import time
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+REVISION_LABEL = '{{index .Config.Labels "org.opencontainers.image.revision"}}'
+COMPOSE_OPTIONS_WITH_VALUE = ("--project-directory", "--env-file", "-p", "--project-name", "-f", "--file", "--profile")
+
+
+def config():
+    with open(os.path.join(HERE, "fake-config.json")) as handle:
+        return json.load(handle)
+
+
+@contextlib.contextmanager
+def locked_state():
+    paths = config()
+    with open(paths["state"] + ".lock", "a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        with open(paths["state"]) as handle:
+            state = json.load(handle)
+        yield state
+        with open(paths["state"] + ".tmp", "w") as handle:
+            json.dump(state, handle)
+        os.replace(paths["state"] + ".tmp", paths["state"])
+
+
+def log_call(argv, project, sub):
+    entry = {"argv": argv, "project": project, "sub": sub, "revision": os.environ.get("DHT_REVISION"), "restart": os.environ.get("DHT_RESTART"), "time": time.time(), "pid": os.getpid()}
+    with open(config()["log"], "a") as handle:
+        handle.write(json.dumps(entry) + "\n")
+
+
+def new_id(state, prefix):
+    state["counter"] = state.get("counter", 0) + 1
+    return "%s%04d" % (prefix, state["counter"])
+
+
+def image_tag():
+    return os.environ.get("DHT_IMAGE") or "dht-scraper:local"
+
+
+def find_image(state, reference):
+    image_id = state["tags"].get(reference, reference)
+    return image_id if image_id in state["images"] else None
+
+
+def containers_of(state, project, service=None, running_only=False):
+    return [cid for cid, item in sorted(state["containers"].items()) if item["project"] == project and (service is None or item["service"] == service) and (item["running"] or not running_only)]
+
+
+def fail(message, code=1):
+    sys.stderr.write(message + "\n")
+    sys.exit(code)
+
+
+def compose(args):
+    project = "default"
+    index = 0
+    while index < len(args) and args[index].startswith("-"):
+        if args[index] in ("-p", "--project-name"):
+            project = args[index + 1]
+        index += 2 if args[index] in COMPOSE_OPTIONS_WITH_VALUE else 1
+    sub = args[index] if index < len(args) else ""
+    rest = args[index + 1:]
+    log_call(["compose"] + args, project, sub)
+    if sub == "version":
+        print("Docker Compose version v5.5.1")
+        return
+    with locked_state() as state:
+        if not state["daemon"]:
+            fail("Cannot connect to the Docker daemon. Is the docker daemon running?")
+        if sub == "ps":
+            running_only = "--status" in rest and rest[rest.index("--status") + 1] == "running"
+            services = [item for item in rest if not item.startswith("-") and item != "running"]
+            for cid in containers_of(state, project, services[0] if services else None, running_only):
+                print(cid)
+        elif sub == "pull":
+            pass
+        elif sub == "build":
+            revision = os.environ.get("DHT_REVISION") or "unknown"
+            if revision in state["fail"].get("build", []):
+                fail("failed to solve: fake build failure for %s" % revision, 17)
+            image_id = new_id(state, "img")
+            state["images"][image_id] = {"revision": revision}
+            state["tags"][image_tag()] = image_id
+        elif sub == "up":
+            compose_up(state, project, rest)
+        elif sub in ("down", "rm"):
+            for cid in containers_of(state, project):
+                del state["containers"][cid]
+        elif sub in ("kill", "stop"):
+            for cid in containers_of(state, project, running_only=True):
+                state["containers"][cid]["running"] = False
+                state["containers"][cid]["exit_code"] = 143
+        elif sub == "port":
+            print("0.0.0.0:%s" % (rest[-1] if rest else "8080"))
+        else:
+            fail("fake docker: unsupported compose command %s" % sub)
+
+
+def compose_up(state, project, rest):
+    services = [item for item in rest if not item.startswith("-") and not item.isdigit()]
+    wanted = services or ["scraper"]
+    tag_image = state["tags"].get(image_tag())
+    if tag_image is None:
+        tag_image = new_id(state, "img")
+        state["images"][tag_image] = {"revision": "unknown"}
+        state["tags"][image_tag()] = tag_image
+    for service in wanted:
+        image = tag_image
+        current = containers_of(state, project, service)
+        if current and state["containers"][current[0]]["image"] == image:
+            state["containers"][current[0]]["running"] = True
+            continue
+        for cid in current:
+            del state["containers"][cid]
+        cid = new_id(state, "ctr")
+        state["containers"][cid] = {"project": project, "service": service, "image": image, "running": True, "exit_code": 0}
+        if service == "scraper" and state["images"][image]["revision"] in state["fail"].get("up", []):
+            state["containers"][cid].update(running=False, exit_code=1)
+            fail("container %s-scraper-1 exited (1)" % project)
+
+
+def main(argv):
+    if not argv:
+        fail("fake docker: no command", 2)
+    command, args = argv[0], argv[1:]
+    if command == "compose":
+        compose(args)
+        return
+    log_call(argv, None, command)
+    if command == "logs":
+        cid = args[-1]
+        print("fake scraper log for %s" % cid, flush=True)
+        try:
+            while True:
+                with locked_state() as state:
+                    item = state["containers"].get(cid)
+                    if item is None or not item["running"]:
+                        return
+                time.sleep(0.05)
+        except KeyboardInterrupt:
+            sys.exit(130)
+    with locked_state() as state:
+        if command == "info":
+            if not state["daemon"]:
+                fail("Cannot connect to the Docker daemon. Is the docker daemon running?")
+            print("Server Version: fake")
+        elif command == "volume" and args[0] == "create":
+            if args[-1] not in state["volumes"]:
+                state["volumes"].append(args[-1])
+            print(args[-1])
+        elif command == "volume" and args[0] == "inspect":
+            if args[-1] not in state["volumes"]:
+                fail("Error: No such volume: %s" % args[-1])
+            print("[]")
+        elif command == "image" and args[0] == "inspect":
+            image_id = find_image(state, args[-1])
+            if image_id is None:
+                fail("Error: No such image: %s" % args[-1])
+            print(state["images"][image_id]["revision"] if REVISION_LABEL in args else image_id)
+        elif command == "inspect":
+            item = state["containers"].get(args[-1])
+            if item is None:
+                fail("Error: No such object: %s" % args[-1])
+            fmt = args[args.index("-f") + 1]
+            values = {"{{.Image}}": item["image"], "{{.State.ExitCode}}": item["exit_code"], "{{.State.Running}}": str(item["running"]).lower()}
+            print(values[fmt])
+        else:
+            fail("fake docker: unsupported command %s" % " ".join(argv))
+
+
+if __name__ == "__main__":
+    main(sys.argv[1:])

@@ -2,14 +2,18 @@
 import http.server
 import json
 import logging
+import sqlite3
 import string
+import threading
+import time
 import urllib.parse
-from typing import Any, Callable, Dict, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from dht_scraper.event_log import LOGGER_NAME
 from dht_scraper.magnet_link import build_magnet_link
 from dht_scraper.node_identity import NODE_ID_LENGTH, is_valid_node_id
 from dht_scraper.torrent_catalog import TorrentCatalog
+from dht_scraper.torrent_database import TorrentDatabase, document_detail_record
 from dht_scraper.web_page import render_index_page
 
 LOGGER = logging.getLogger(LOGGER_NAME)
@@ -20,10 +24,14 @@ MAX_SEARCH_LIMIT = 200
 MAX_QUERY_LENGTH = 200
 ROUTE_TORRENT_PREFIX = "/api/torrent/"
 SERVER_POLL_SECONDS = 0.5
+INDEX_PAUSE_SECONDS = 30.0
+ENGINE_SQLITE = "sqlite"
+ENGINE_MEMORY = "memory"
 CONTENT_JSON = "application/json; charset=utf-8"
 CONTENT_HTML = "text/html; charset=utf-8"
 CONTENT_SECURITY_POLICY = "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'self'"
 StatsProvider = Callable[[], Dict[str, Any]]
+Clock = Callable[[], float]
 Response = Tuple[int, str, bytes]
 
 
@@ -88,13 +96,42 @@ class CatalogWebServer(http.server.ThreadingHTTPServer):
     allow_reuse_address = True
 
     # Parents: create_web_server
-    # Keywords: http server, bind, catalog, stats
-    def __init__(self, address: Tuple[str, int], catalog: TorrentCatalog, stats_provider: StatsProvider) -> None:
+    # Keywords: http server, bind, catalog, stats, search index
+    def __init__(
+        self,
+        address: Tuple[str, int],
+        catalog: TorrentCatalog,
+        stats_provider: StatsProvider,
+        database: Optional[TorrentDatabase] = None,
+        clock: Clock = time.monotonic,
+    ) -> None:
         assert len(address) == 2 and callable(stats_provider)
         self.catalog = catalog
         self.stats_provider = stats_provider
+        self.database = database
+        self.clock = clock
+        self.index_lock = threading.Lock()
+        self.index_paused_until = float("-inf")
         super().__init__(address, CatalogRequestHandler)
         assert self.server_address[1] > 0
+
+    # Parents: CatalogRequestHandler.search_records, CatalogRequestHandler.render_torrent
+    # Keywords: search index, pause, available
+    def index_available(self) -> bool:
+        assert self.index_lock is not None
+        with self.index_lock:
+            result = self.database is not None and self.clock() >= self.index_paused_until
+        assert isinstance(result, bool)
+        return result
+
+    # Parents: CatalogRequestHandler.search_records, CatalogRequestHandler.render_torrent
+    # Keywords: search index, failure, pause, warning
+    def pause_index(self, error: sqlite3.Error) -> None:
+        assert isinstance(error, sqlite3.Error)
+        with self.index_lock:
+            self.index_paused_until = self.clock() + INDEX_PAUSE_SECONDS
+        LOGGER.warning("search index unavailable, searching memory for %d s: %s", INDEX_PAUSE_SECONDS, error)
+        assert self.index_paused_until > float("-inf")
 
 
 class CatalogRequestHandler(http.server.BaseHTTPRequestHandler):
@@ -142,9 +179,23 @@ class CatalogRequestHandler(http.server.BaseHTTPRequestHandler):
     def render_search(self, query_string: str) -> Response:
         assert isinstance(query_string, str)
         query, limit = parse_search_query(query_string)
-        results = [attach_magnet(record, record["name"]) for record in self.server.catalog.search(query, limit)]
-        result = (200, CONTENT_JSON, encode_json({"query": query, "limit": limit, "count": len(results), "results": results}))
+        engine, records = self.search_records(query, limit)
+        results = [attach_magnet(record, record["name"]) for record in records]
+        result = (200, CONTENT_JSON, encode_json({"query": query, "limit": limit, "count": len(results), "engine": engine, "results": results}))
         assert result[0] == 200
+        return result
+
+    # Parents: render_search
+    # Keywords: search, database first, memory fallback
+    def search_records(self, query: str, limit: int) -> Tuple[str, List[Dict[str, Any]]]:
+        assert 1 <= limit <= MAX_SEARCH_LIMIT
+        if self.server.index_available():
+            try:
+                return ENGINE_SQLITE, self.server.database.search(query, limit)
+            except sqlite3.Error as error:
+                self.server.pause_index(error)
+        result = (ENGINE_MEMORY, self.server.catalog.search(query, limit))
+        assert len(result[1]) <= limit
         return result
 
     # Parents: dispatch
@@ -155,8 +206,19 @@ class CatalogRequestHandler(http.server.BaseHTTPRequestHandler):
         if info_hash is None:
             return self.render_error(400, "invalid info hash")
         record = self.server.catalog.torrent_detail(info_hash)
+        index_failed = False
+        if (record is None or record["metadata"] is None) and self.server.database is not None:
+            if self.server.index_available():
+                try:
+                    document = self.server.database.get_document(info_hash.hex())
+                    record = record if document is None else document_detail_record(document)
+                except sqlite3.Error as error:
+                    self.server.pause_index(error)
+                    index_failed = True
+            else:
+                index_failed = True
         if record is None:
-            return self.render_error(404, "not found")
+            return self.render_error(503, "search index unavailable") if index_failed else self.render_error(404, "not found")
         name = record["metadata"]["name"] if record.get("metadata") else ""
         result = (200, CONTENT_JSON, encode_json(attach_magnet(record, name)))
         assert result[0] == 200
@@ -196,9 +258,9 @@ class CatalogRequestHandler(http.server.BaseHTTPRequestHandler):
 
 # Parents: ScraperRuntime.start_web
 # Keywords: web server, bind, create
-def create_web_server(host: str, port: int, catalog: TorrentCatalog, stats_provider: StatsProvider) -> CatalogWebServer:
+def create_web_server(host: str, port: int, catalog: TorrentCatalog, stats_provider: StatsProvider, database: Optional[TorrentDatabase] = None) -> CatalogWebServer:
     assert host and 0 <= port <= 65535
-    server = CatalogWebServer((host, port), catalog, stats_provider)
+    server = CatalogWebServer((host, port), catalog, stats_provider, database)
     LOGGER.info("web interface listening on %s", web_url(server.server_address[0], server.server_address[1]))
     assert server.server_address[1] > 0
     return server

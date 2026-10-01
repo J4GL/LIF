@@ -5,8 +5,21 @@ import os
 import socket
 import tempfile
 import unittest
+from unittest import mock
 
 from dht_scraper.__main__ import build_settings, main, parse_arguments, run_scraper
+
+DATABASE_VARIABLE = "DHT_DATABASE"
+ENVIRONMENT = mock.patch.dict(os.environ, {})
+
+
+def setUpModule():
+    ENVIRONMENT.start()
+    os.environ.pop(DATABASE_VARIABLE, None)
+
+
+def tearDownModule():
+    ENVIRONMENT.stop()
 
 
 class ParseArgumentsTest(unittest.TestCase):
@@ -42,6 +55,28 @@ class ParseArgumentsTest(unittest.TestCase):
     def test_build_settings_maps_arguments(self):
         run_settings = build_settings(parse_arguments(["--nodes", "2", "--no-fetch", "--no-browser", "--fetch-workers", "3"]))
         self.assertEqual((run_settings.nodes, run_settings.fetch_enabled, run_settings.open_browser, run_settings.fetch_workers), (2, False, False, 3))
+
+
+class DatabaseOptionSpecTest(unittest.TestCase):
+    def test_CLI_002_database_option(self):
+        directory = tempfile.mkdtemp(prefix="dht-cli-")
+        self.addCleanup(os.rmdir, directory)
+        first, second = os.path.join(directory, "a.sqlite3"), os.path.join(directory, "b.sqlite3")
+        with self.subTest(case="unset"), mock.patch.dict(os.environ, {}):
+            args = parse_arguments([])
+            self.assertIsNone(args.database)
+            self.assertIsNone(build_settings(args).database_path)
+        with self.subTest(case="environment"), mock.patch.dict(os.environ, {DATABASE_VARIABLE: first}):
+            self.assertEqual(build_settings(parse_arguments([])).database_path, first)
+        with self.subTest(case="option wins"), mock.patch.dict(os.environ, {DATABASE_VARIABLE: first}):
+            self.assertEqual(build_settings(parse_arguments(["--database", second])).database_path, second)
+        with self.subTest(case="empty"), mock.patch.dict(os.environ, {DATABASE_VARIABLE: ""}):
+            self.assertIsNone(parse_arguments([]).database)
+        with self.subTest(case="missing directory"), mock.patch.dict(os.environ, {}):
+            stderr = io.StringIO()
+            with self.assertRaises(SystemExit), contextlib.redirect_stderr(stderr):
+                parse_arguments(["--database", "/missing-dir/x.sqlite3"])
+            self.assertIn("/missing-dir", stderr.getvalue())
 
 
 class StartFailureTest(unittest.TestCase):

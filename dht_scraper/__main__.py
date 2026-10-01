@@ -1,6 +1,8 @@
 """Command line entry point: python3 -m dht_scraper."""
 import argparse
 import logging
+import os
+import sqlite3
 import sys
 from typing import List, Optional
 
@@ -8,20 +10,21 @@ from dht_scraper.dht_crawler import DEFAULT_BOOTSTRAP_NODES
 from dht_scraper.event_log import LOGGER_NAME, configure_logging
 from dht_scraper.fetch_engine import DEFAULT_MAX_CONNECTIONS
 from dht_scraper.metadata_fetcher import fetch_metadata
-from dht_scraper.scraper_runtime import DEFAULT_BATCH_SIZE, DEFAULT_INTERVAL, DEFAULT_NODES, DEFAULT_PORT, RuntimeSettings, ScraperRuntime, settings_error
+from dht_scraper.scraper_runtime import DEFAULT_BATCH_SIZE, DEFAULT_INTERVAL, DEFAULT_NODES, DEFAULT_PORT, RuntimeSettings, ScraperRuntime, database_error, settings_error
 from dht_scraper.stream_encryption import fetch_metadata_encrypted
 from dht_scraper.utp_transport import fetch_metadata_utp
 from dht_scraper.torrent_catalog import TorrentCatalog
 from dht_scraper.web_interface import DEFAULT_WEB_HOST, DEFAULT_WEB_PORT
 
 LOGGER = logging.getLogger(LOGGER_NAME)
+DATABASE_VARIABLE = "DHT_DATABASE"
 
 
 # Parents: main
 # Keywords: argparse, cli, options, validation
 def parse_arguments(argv: List[str]) -> argparse.Namespace:
     assert isinstance(argv, list), "argv must be a list"
-    parser = argparse.ArgumentParser(prog="dht_scraper", description="Educational BitTorrent DHT scraper with metadata fetching and a web UI. Nothing is stored on disk.")
+    parser = argparse.ArgumentParser(prog="dht_scraper", description="Educational BitTorrent DHT scraper with metadata fetching and a web UI. Nothing is stored on disk unless a search database is given.")
     parser.add_argument("--port", type=int, default=DEFAULT_PORT, help="first UDP port; each node uses the next port (default %d, 0 = OS chosen)" % DEFAULT_PORT)
     parser.add_argument("--nodes", type=int, default=DEFAULT_NODES, help="number of simulated DHT nodes (default %d)" % DEFAULT_NODES)
     parser.add_argument("--web-host", default=DEFAULT_WEB_HOST, help="web UI bind address (default %s)" % DEFAULT_WEB_HOST)
@@ -35,8 +38,11 @@ def parse_arguments(argv: List[str]) -> argparse.Namespace:
     parser.add_argument("--no-fetch", action="store_true", help="crawl only, do not fetch metadata")
     parser.add_argument("--no-browser", action="store_true", help="do not open the web UI in the browser")
     parser.add_argument("--ipv6", action="store_true", help="also crawl the IPv6 DHT (BEP 32): more hashes, about 20 %% more UDP traffic")
+    parser.add_argument("--database", default=os.environ.get(DATABASE_VARIABLE) or None, help="SQLite file that keeps torrents with metadata and answers typo-tolerant searches (default: $%s; none = memory only)" % DATABASE_VARIABLE)
     args = parser.parse_args(argv)
     problem = settings_error(args.port, args.nodes, args.web_host, args.web_port, args.duration, args.fetch_workers, args.batch_size, args.interval)
+    if problem is None and args.database is not None:
+        problem = database_error(args.database)
     if problem is not None:
         parser.error(problem)
     assert isinstance(args, argparse.Namespace)
@@ -59,6 +65,7 @@ def build_settings(args: argparse.Namespace) -> RuntimeSettings:
         fetch_enabled=not args.no_fetch,
         open_browser=not args.no_browser,
         ipv6_enabled=args.ipv6,
+        database_path=args.database,
     )
     assert result.nodes == args.nodes
     return result
@@ -72,7 +79,7 @@ def run_scraper(args: argparse.Namespace) -> int:
     runtime = ScraperRuntime(settings, TorrentCatalog(), fetch_metadata, DEFAULT_BOOTSTRAP_NODES, retry_function=fetch_metadata_encrypted, utp_function=fetch_metadata_utp)
     try:
         runtime.run(settings.duration)
-    except OSError as error:
+    except (OSError, sqlite3.Error) as error:
         LOGGER.error("cannot start: %s", error)
         return 1
     assert runtime.stopped

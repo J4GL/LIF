@@ -1,0 +1,27 @@
+#!/usr/bin/env python3
+"""Fake crontab: `-l`, `-r` and installing from stdin (`-`) or a file, on the file named in fake-config.json."""
+import json
+import os
+import sys
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+with open(os.path.join(HERE, "fake-config.json")) as handle:
+    TABLE = json.load(handle)["crontab"]
+
+arguments = sys.argv[1:]
+if arguments == ["-l"]:
+    content = open(TABLE).read() if os.path.exists(TABLE) else ""
+    if not content:
+        sys.stderr.write("crontab: no crontab for user\n")
+        sys.exit(1)
+    sys.stdout.write(content)
+elif arguments == ["-r"]:
+    if os.path.exists(TABLE):
+        os.remove(TABLE)
+elif len(arguments) == 1:
+    content = sys.stdin.read() if arguments[0] == "-" else open(arguments[0]).read()
+    with open(TABLE, "w") as handle:
+        handle.write(content)
+else:
+    sys.stderr.write("usage: crontab [-l | -r | file]\n")
+    sys.exit(2)
