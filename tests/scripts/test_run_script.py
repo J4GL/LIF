@@ -43,6 +43,7 @@ class RunScriptSpecTest(unittest.TestCase):
                 self.assertTrue(wait_until(lambda: sandbox.containers(RUN_PROJECT, running_only=True) == {}, timeout=5))
                 self.assertEqual([call for call in sandbox.state_changing_calls() if call["project"] == PROJECT], [])
                 self.assertIn(PROJECT + "-data", sandbox.read_state()["volumes"])
+                self.assertEqual(sorted(sandbox.read_state()["tags"]), ["dht-scraper:local-run"])
                 self.assertTrue(all(call["restart"] == "no" for call in sandbox.state_changing_calls() if call["argv"][0] == "compose"))
                 if case == "HUP":
                     self.assertTrue(wait_until(lambda: "stopping" in read_text(os.path.join(sandbox.log_dir, "run.log")) if os.path.exists(os.path.join(sandbox.log_dir, "run.log")) else False, timeout=5))

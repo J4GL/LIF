@@ -128,6 +128,9 @@ class CatalogWebServer(http.server.ThreadingHTTPServer):
     # Keywords: search index, failure, pause, warning
     def pause_index(self, error: sqlite3.Error) -> None:
         assert isinstance(error, sqlite3.Error)
+        if is_transient_error(error):
+            LOGGER.warning("search index busy, this request uses memory: %s", error)
+            return
         with self.index_lock:
             self.index_paused_until = self.clock() + INDEX_PAUSE_SECONDS
         LOGGER.warning("search index unavailable, searching memory for %d s: %s", INDEX_PAUSE_SECONDS, error)
@@ -254,6 +257,16 @@ class CatalogRequestHandler(http.server.BaseHTTPRequestHandler):
         level = logging.DEBUG if "/api/stats" in getattr(self, "path", "") else logging.INFO
         LOGGER.log(level, "web %s %s", self.address_string(), format % args)
         assert True
+
+
+# Parents: CatalogWebServer.pause_index
+# Keywords: busy, locked, transient, no pause
+def is_transient_error(error: sqlite3.Error) -> bool:
+    assert isinstance(error, sqlite3.Error)
+    message = str(error).lower()
+    result = isinstance(error, sqlite3.OperationalError) and ("locked" in message or "busy" in message)
+    assert isinstance(result, bool)
+    return result
 
 
 # Parents: ScraperRuntime.start_web

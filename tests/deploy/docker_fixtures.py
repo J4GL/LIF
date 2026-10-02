@@ -82,4 +82,4 @@ class ComposeProject:
         for project in (self.project, self.project + "-run"):
             self.compose("down", "--remove-orphans", "-t", "5", project=project, check=False)
         docker("volume", "rm", "-f", self.volume, check=False)
-        docker("image", "rm", "-f", self.image, check=False)
+        docker("image", "rm", "-f", self.image, self.image + "-run", check=False)

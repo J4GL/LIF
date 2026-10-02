@@ -53,6 +53,14 @@ class SearchIndexerSpecTest(IndexerTestCase):
             detail = self.catalog.torrent_detail(bytes.fromhex(info_hash_hex(1)))
             self.assertEqual((detail["seen_count"], detail["fetch_state"]), (13, "done"))
             self.assertEqual(self.catalog.snapshot_counts()["metadata_in_memory"], 0)
+        with self.subTest(case="oversized"):
+            database = open_database(self)
+            huge = TorrentMetadata(bytes.fromhex(info_hash_hex(9)), "Huge", 2 ** 63 + 5, 2 ** 64, 1, [TorrentFile("Huge", 2 ** 63 + 5)], False, 9.0, None)
+            self.catalog.store_metadata(huge, now=100.0)
+            indexer = self.make_indexer(database)
+            indexer.flush_documents()
+            row = database.get_document(info_hash_hex(9))
+            self.assertEqual((row["size"], row["piece_length"]), (2 ** 63 - 1, 2 ** 63 - 1))
         with self.subTest(case="30 files"):
             database = open_database(self)
             paths = ["f%02d.bin" % index for index in range(1, 31)]
@@ -108,6 +116,15 @@ class SearchIndexerSpecTest(IndexerTestCase):
         database.failing = False
         self.assertTrue(wait_until(lambda: database.database.count_documents() == 51, timeout=2.0))
         self.assertTrue(wait_until(lambda: indexer.snapshot_counts()["index_backlog"] == 0, timeout=2.0))
+        errors = indexer.snapshot_counts()["index_errors"]
+        database.failing = ValueError("unexpected (injected)")
+        with self.assertLogs("dht_scraper", level="ERROR") as logs:
+            self.assertTrue(wait_until(lambda: indexer.snapshot_counts()["index_errors"] > errors, timeout=2.0))
+        self.assertTrue(any("unexpected (injected)" in line for line in logs.output))
+        database.failing = False
+        self.catalog.store_metadata(metadata(60, "after"))
+        self.assertTrue(wait_until(lambda: database.database.get_document(info_hash_hex(60)) is not None, timeout=2.0))
+        self.assertTrue(indexer.thread.is_alive())
 
     def test_SEARCH_005_final_flush_on_stop(self):
         with self.subTest(case="flush"):

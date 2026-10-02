@@ -18,6 +18,8 @@ MIN_TYPO_LENGTH = 4
 MAX_TYPO_TERMS = 20
 MAX_QUERY_TERMS = 16
 MAX_LOOKUP_PARAMETERS = 500
+MAX_SQLITE_INTEGER = 2 ** 63 - 1
+SIZE_INDEX_SQL = "CREATE INDEX IF NOT EXISTS torrents_size ON torrents (size)"
 TERM_PATTERN = re.compile(r"[^\W_]+")
 DOCUMENT_COLUMNS = ("info_hash", "name", "size", "file_count", "piece_length", "is_private", "fetched_at", "seen_count", "announce_count", "first_seen", "last_seen")
 SEARCH_COLUMNS = ("info_hash", "name", "size", "file_count", "seen_count", "announce_count", "first_seen", "last_seen")
@@ -40,6 +42,7 @@ CREATE TABLE torrents (
     files_json TEXT NOT NULL
 );
 CREATE INDEX torrents_rank ON torrents (seen_count DESC, last_seen DESC);
+CREATE INDEX torrents_size ON torrents (size);
 CREATE VIRTUAL TABLE torrents_fts USING fts5(name, files, content='', tokenize='unicode61 remove_diacritics 2');
 CREATE TABLE terms (variant TEXT NOT NULL, term TEXT NOT NULL, PRIMARY KEY (variant, term)) WITHOUT ROWID;
 PRAGMA user_version = 1;
@@ -197,6 +200,7 @@ class TorrentDatabase:
             created = version == 0
             if created:
                 connection.executescript(SCHEMA_SQL)
+            connection.execute(SIZE_INDEX_SQL)
         except BaseException:
             connection.close()
             raise
@@ -287,10 +291,10 @@ class TorrentDatabase:
 
     # Parents: SearchIndexer.flush_documents, tests
     # Keywords: index base, previous runs, chunks
-    def lookup_counters(self, info_hashes: Sequence[str]) -> Dict[str, Counters]:
+    def lookup_counters(self, info_hashes: Sequence[str], reader: Optional[sqlite3.Connection] = None) -> Dict[str, Counters]:
         assert all(len(info_hash) == 40 for info_hash in info_hashes)
         result: Dict[str, Counters] = {}
-        connection = self.connect_reader()
+        connection = reader or self.connect_reader()
         try:
             for start in range(0, len(info_hashes), MAX_LOOKUP_PARAMETERS):
                 chunk = list(info_hashes[start:start + MAX_LOOKUP_PARAMETERS])
@@ -298,7 +302,8 @@ class TorrentDatabase:
                 for info_hash, seen_count, announce_count, first_seen in connection.execute(query, chunk):
                     result[info_hash] = (seen_count, announce_count, first_seen)
         finally:
-            connection.close()
+            if reader is None:
+                connection.close()
         assert len(result) <= len(info_hashes)
         return result
 
@@ -314,15 +319,16 @@ class TorrentDatabase:
         return result
 
     # Parents: SearchIndexer.refresh_count, tests
-    # Keywords: count, total size, statistics
-    def document_totals(self) -> Tuple[int, int]:
-        connection = self.connect_reader()
+    # Keywords: count, total size, statistics, size index, no overflow
+    def document_totals(self, reader: Optional[sqlite3.Connection] = None) -> Tuple[int, int]:
+        connection = reader or self.connect_reader()
         try:
-            count, size = connection.execute("SELECT count(*), coalesce(sum(size), 0) FROM torrents").fetchone()
+            count, size = connection.execute("SELECT count(*), total(size) FROM torrents INDEXED BY torrents_size").fetchone()
         finally:
-            connection.close()
+            if reader is None:
+                connection.close()
         assert count >= 0 and size >= 0
-        return count, size
+        return count, int(size)
 
     # Parents: CatalogRequestHandler.render_torrent, tests
     # Keywords: detail, document, files json

@@ -69,8 +69,10 @@ main() {
     fi
     ensure_volume
     DHT_RESTART=no
+    # Its own image tag: a temporary build never replaces the service's image.
+    DHT_IMAGE="${DHT_IMAGE:-dht-scraper:local}-run"
     DHT_REVISION=$(revision)
-    export DHT_RESTART DHT_REVISION
+    export DHT_RESTART DHT_IMAGE DHT_REVISION
     compose "$RUN_PROJECT" down --remove-orphans >/dev/null 2>&1 || true
     compose "$RUN_PROJECT" build
     trap cleanup EXIT

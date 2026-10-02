@@ -320,7 +320,9 @@ more hashes for about 20 % more traffic.
 
 All tests except `deploy` run offline with fake sockets, loopback sockets on port 0 (IPv4 and
 `::1`), fake peers for TCP, MSE and uTP, temporary SQLite files and fake `docker` and `crontab`
-commands. The `deploy` tests need Docker and the network. Test methods carry the ID of the spec they check, for example
+commands. The `deploy` tests need Docker and the network. The page tests load the page in the
+headless browser [Obscura](https://github.com/h4ckf0r0day/obscura) 0.2.3 (`OBSCURA_BIN`, the `PATH`
+or `~/.local/bin/obscura`) and are skipped without it. Test methods carry the ID of the spec they check, for example
 `test_LOOKUP_001_...`.
 
 ## Code layout

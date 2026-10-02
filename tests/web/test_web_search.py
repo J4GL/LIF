@@ -1,5 +1,6 @@
 """Web category: /api/search and /api/torrent with the SQLite database (SEARCH-010 to SEARCH-012, SEARCH-014)."""
 import json
+import sqlite3
 import threading
 import unittest
 
@@ -72,6 +73,14 @@ class WebSearchSpecTest(WebSearchTestCase):
         self.assertEqual(len(warnings), 1)
         self.database.failing = False
         self.clock.now = 31.0
+        self.assertEqual(self.search_names("alpha"), [])
+        self.database.failing = sqlite3.OperationalError("database is locked")
+        with self.assertLogs("dht_scraper", level="INFO"):
+            first = self.get("/api/search?q=alpha")
+            second = self.get("/api/search?q=alpha")
+        self.assertEqual((first[1]["engine"], second[1]["engine"]), ("memory", "memory"))
+        self.assertEqual(self.database.call_names().count("search"), 4)
+        self.database.failing = False
         self.assertEqual(self.search_names("alpha"), [])
 
     def test_SEARCH_012_detail_resolution(self):

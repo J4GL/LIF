@@ -96,7 +96,7 @@ INDEX_PAGE_HTML = """<!DOCTYPE html>
 
   function clearChildren(element) { while (element.firstChild) { element.removeChild(element.firstChild); } }
   function formatBytes(n) {
-    var units = ["B", "KiB", "MiB", "GiB", "TiB"]; var i = 0; var v = Number(n) || 0;
+    var units = ["B", "KiB", "MiB", "GiB", "TiB", "PiB", "EiB"]; var i = 0; var v = Number(n) || 0;
     while (v >= 1024 && i < units.length - 1) { v /= 1024; i += 1; }
     return (i === 0 ? v : v.toFixed(1)) + " " + units[i];
   }

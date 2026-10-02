@@ -64,6 +64,8 @@ class FailingDatabase:
         def call(*args, **kwargs):
             with self.lock:
                 self.calls.append((name, time.monotonic()))
+            if isinstance(self.failing, BaseException):
+                raise self.failing
             if self.failing:
                 raise sqlite3.OperationalError("disk I/O error (injected)")
             return target(*args, **kwargs)

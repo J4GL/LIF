@@ -24,7 +24,7 @@ class TextTermsTest(unittest.TestCase):
 
 class TorrentDatabaseSpecTest(unittest.TestCase):
     def test_SEARCH_020_database_scenarios(self):
-        for scenario in (self.case_schema, self.case_tokens, self.case_typos, self.case_order, self.case_writes, self.case_lookup, self.case_detail):
+        for scenario in (self.case_schema, self.case_tokens, self.case_typos, self.case_order, self.case_writes, self.case_lookup, self.case_detail, self.case_totals):
             with self.subTest(case=scenario.__name__):
                 scenario()
 
@@ -103,6 +103,10 @@ class TorrentDatabaseSpecTest(unittest.TestCase):
         self.assertEqual(found[info_hash_hex(250)], (250, 1, 250.0))
         self.assertNotIn(info_hash_hex(1000), found)
         self.assertEqual(database.count_documents(), 300)
+
+    def case_totals(self):
+        database = open_database(self, [document(1, "big", lengths=[2 ** 62]), document(2, "bigger", lengths=[2 ** 62]), document(3, "small", lengths=[7])])
+        self.assertEqual(database.document_totals(), (3, int(float(2 ** 63 + 7))))
 
     def case_detail(self):
         stored = document(7, "detail", files=["a/1.bin", "a/2.bin"], lengths=[7, 9])

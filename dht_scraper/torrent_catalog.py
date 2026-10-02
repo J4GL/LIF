@@ -42,7 +42,7 @@ class TorrentEntry:
     __slots__ = (
         "info_hash", "first_seen", "last_seen", "seen_count", "announce_count", "peers", "failed_peers", "fetch_state",
         "fetch_attempts", "last_error", "lookups_started", "lookup_in_progress", "next_lookup_time", "metadata", "index_base",
-        "in_database", "database_checked",
+        "in_database", "database_checked", "known_from_database",
     )
 
     # Parents: TorrentCatalog._get_or_create_locked
@@ -66,6 +66,7 @@ class TorrentEntry:
         self.index_base: Optional[IndexBase] = None
         self.in_database = False
         self.database_checked = True
+        self.known_from_database = False
         assert self.fetch_state == FETCH_PENDING and self.metadata is None
 
 
@@ -173,6 +174,7 @@ class TorrentCatalog:
         self._index_dropped = 0
         self._check_database = False
         self._metadata_bytes = 0
+        self._known_done = 0
         self._needs_check: Dict[bytes, TorrentEntry] = {}
         self.max_entries = max_entries
         self.max_peers_per_hash = max_peers_per_hash
@@ -304,8 +306,9 @@ class TorrentCatalog:
         moment = moment_or_now(now)
         with self._lock:
             entry, created = self._get_or_create_locked(metadata.info_hash, moment)
-            if entry.fetch_state != FETCH_DONE:
+            if entry.fetch_state != FETCH_DONE or entry.known_from_database:
                 self._metadata_bytes += metadata.total_size
+            self._forget_known_locked(entry)
             entry.metadata = metadata
             entry.last_error = ""
             self._set_state_locked(entry, FETCH_DONE)
@@ -367,7 +370,8 @@ class TorrentCatalog:
                 "hashes_seen": len(self._entries),
                 "hashes_discovered": self._discovered,
                 "observations": self._observations,
-                "with_metadata": self._state_counts[FETCH_DONE],
+                "with_metadata": self._state_counts[FETCH_DONE] - self._known_done,
+                "known_from_database": self._known_done,
                 "metadata_in_memory": len(self._fetched),
                 "metadata_bytes": self._metadata_bytes,
                 "fetch_pending": self._state_counts[FETCH_PENDING],
@@ -461,9 +465,10 @@ class TorrentCatalog:
         assert all(isinstance(snapshot, IndexSnapshot) for snapshot in snapshots)
         with self._lock:
             for snapshot in snapshots:
-                if self._entries.get(snapshot.info_hash) is snapshot.entry:
+                if self._entries.get(snapshot.info_hash) is snapshot.entry or snapshot.info_hash not in self._entries:
                     self._index_counters.setdefault(snapshot.info_hash, snapshot.entry)
-        assert len(self._index_counters) <= len(self._entries)
+            requeued = all(snapshot.info_hash in self._index_counters or snapshot.info_hash in self._entries for snapshot in snapshots)
+        assert requeued
 
     # Parents: SearchIndexer.flush_documents
     # Keywords: search index, base, previous runs, written
@@ -515,12 +520,15 @@ class TorrentCatalog:
                     entry.in_database = True
                     entry.peers = None
                     entry.failed_peers = None
+                    entry.known_from_database = True
+                    self._known_done += 1
                     self._set_state_locked(entry, FETCH_DONE)
                     if self._index_tracking:
                         self._index_counters.setdefault(info_hash, entry)
                 self._index_entry_locked(entry)
             self._assert_invariants_locked()
-        assert all(info_hash not in self._needs_check for info_hash in info_hashes)
+            checked = all(self._entries.get(info_hash) is None or self._entries[info_hash].database_checked for info_hash in info_hashes)
+        assert checked
 
     # Parents: SearchIndexer.flush_counters
     # Keywords: search index, missing document, resend in full, fetch again
@@ -536,6 +544,7 @@ class TorrentCatalog:
                 elif entry.in_database:
                     entry.in_database = False
                     entry.database_checked = True
+                    self._forget_known_locked(entry)
                     if entry.fetch_state == FETCH_DONE:
                         self._set_state_locked(entry, FETCH_PENDING)
                     self._index_entry_locked(entry)
@@ -559,9 +568,32 @@ class TorrentCatalog:
         if entry.info_hash not in self._index_documents:
             self._index_documents[entry.info_hash] = entry
             if len(self._index_documents) > self._index_max_pending:
-                self._index_documents.popitem(last=False)
+                _, dropped = self._index_documents.popitem(last=False)
                 self._index_dropped += 1
+                self._drop_unwritten_metadata_locked(dropped)
         assert entry.info_hash in self._index_documents or self._index_dropped > 0
+
+    # Parents: _queue_document_locked
+    # Keywords: dropped document, release metadata, fetch again, memory
+    def _drop_unwritten_metadata_locked(self, entry: TorrentEntry) -> None:
+        assert self._lock.locked()
+        if self._entries.get(entry.info_hash) is entry and entry.metadata is not None and entry.fetch_state == FETCH_DONE:
+            self._metadata_bytes -= entry.metadata.total_size
+            entry.metadata = None
+            entry.database_checked = True
+            self._fetched.pop(entry.info_hash, None)
+            self._set_state_locked(entry, FETCH_PENDING)
+            self._index_entry_locked(entry)
+        assert entry.info_hash not in self._fetched or entry.metadata is not None
+
+    # Parents: store_metadata, reset_index_base, _evict_locked
+    # Keywords: known from database, count, fetched
+    def _forget_known_locked(self, entry: TorrentEntry) -> None:
+        assert self._lock.locked()
+        if entry.known_from_database:
+            entry.known_from_database = False
+            self._known_done -= 1
+        assert self._known_done >= 0
 
     # Parents: mark_index_written
     # Keywords: release, metadata, peers, memory, in database
@@ -583,7 +615,7 @@ class TorrentCatalog:
         entry.last_seen = max(entry.last_seen, moment)
         if source == SOURCE_ANNOUNCE_PEER:
             entry.announce_count += 1
-        if peer is not None:
+        if peer is not None and entry.fetch_state != FETCH_DONE:
             self._add_peer_locked(entry, peer)
         self._needs_lookup.pop(info_hash, None)
         self._index_entry_locked(entry)
@@ -684,7 +716,9 @@ class TorrentCatalog:
             self._fetchable.pop(entry.info_hash, None)
             self._needs_lookup.pop(entry.info_hash, None)
             self._needs_check.pop(entry.info_hash, None)
-            self._index_counters.pop(entry.info_hash, None)
+            if entry.fetch_state == FETCH_DONE and entry.metadata is not None:
+                self._metadata_bytes -= entry.metadata.total_size
+            self._forget_known_locked(entry)
             self._state_counts[entry.fetch_state] -= 1
         self._evicted += len(victims)
         assert len(victims) <= wanted

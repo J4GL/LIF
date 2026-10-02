@@ -335,6 +335,8 @@ class CatalogIndexTrackingSpecTest(unittest.TestCase):
             self.assertEqual([item.info_hash for item in catalog.drain_index_documents(10)], [HASH_B, HASH_C])
             backlog = catalog.index_backlog()
             self.assertEqual((backlog["dropped"], backlog["documents"]), (1, 0))
+            detail = catalog.torrent_detail(HASH_A)
+            self.assertEqual((detail["fetch_state"], detail["metadata"], catalog.snapshot_counts()["metadata_in_memory"]), ("pending", None, 2))
         with self.subTest(case="eviction"):
             catalog = TorrentCatalog(max_entries=2)
             catalog.enable_index_tracking()
@@ -400,6 +402,34 @@ class CatalogIndexTrackingSpecTest(unittest.TestCase):
             self.assertEqual(catalog.torrent_detail(HASH_E)["metadata"]["name"], "second")
             self.assertEqual([item.info_hash for item in catalog.drain_index_documents(10)], [HASH_E])
 
+    def test_CATALOG_012_counters_peers_and_totals(self):
+        peer = ("1.2.3.4", 6881)
+        with self.subTest(case="counters and peers"):
+            catalog = TorrentCatalog(max_entries=3)
+            catalog.enable_index_tracking()
+            catalog.store_metadata(make_metadata(HASH_A), now=20.0)
+            catalog.mark_index_written(catalog.drain_index_documents(10)[0], (5, 0, 1.0))
+            catalog.record_hash(HASH_A, SOURCE_SAMPLE, peer, now=30.0)
+            self.assertEqual(catalog.torrent_detail(HASH_A)["peers"], [])
+            for _ in range(3):
+                catalog.record_hash(HASH_B, SOURCE_SAMPLE, now=40.0)
+                catalog.record_hash(HASH_C, SOURCE_SAMPLE, now=40.0)
+            catalog.record_hash(HASH_D, SOURCE_SAMPLE, peer, now=50.0)
+            self.assertIsNone(catalog.torrent_detail(HASH_A))
+            drained = [(item.info_hash, item.seen_count, item.base) for item in catalog.drain_index_counters(10)]
+            self.assertIn((HASH_A, 1, (5, 0, 1.0)), drained)
+        with self.subTest(case="memory totals"):
+            catalog = TorrentCatalog(max_entries=2)
+            for info_hash, size in ((HASH_A, 5), (HASH_B, 7), (HASH_C, 11)):
+                catalog.store_metadata(make_metadata(info_hash, files=[TorrentFile("f", size)]), now=10.0)
+            catalog.record_hash(HASH_C, SOURCE_SAMPLE, now=20.0)
+            self.assertIsNone(catalog.torrent_detail(HASH_A))
+            counts = catalog.snapshot_counts()
+            self.assertEqual((counts["with_metadata"], counts["metadata_bytes"]), (2, 18))
+            catalog.store_metadata(make_metadata(HASH_A, files=[TorrentFile("f", 5)]), now=30.0)
+            counts = catalog.snapshot_counts()
+            self.assertEqual((counts["with_metadata"], counts["metadata_bytes"]), (3, 23))
+
     def test_CATALOG_011_database_check_gate(self):
         peer = ("1.2.3.4", 6881)
         with self.subTest(case="check"):
@@ -419,7 +449,8 @@ class CatalogIndexTrackingSpecTest(unittest.TestCase):
             self.assertEqual(catalog.torrent_detail(HASH_A)["seen_count"], 8)
             self.assertEqual(catalog.hashes_needing_peers(10), [HASH_C])
             self.assertEqual(catalog.next_fetch_candidates(10), [])
-            self.assertEqual(catalog.snapshot_counts()["with_metadata"], 2)
+            counts = catalog.snapshot_counts()
+            self.assertEqual((counts["with_metadata"], counts["known_from_database"], counts["fetch_done"]), (0, 2, 2))
             catalog.record_hash(HASH_A, SOURCE_SAMPLE, now=20.0)
             drained = sorted((item.info_hash, item.seen_count, item.base) for item in catalog.drain_index_counters(10))
             self.assertEqual(drained, [(HASH_A, 2, (7, 2, 3.0)), (HASH_B, 1, (4, 0, 1.0))])
