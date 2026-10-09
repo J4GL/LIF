@@ -14,6 +14,7 @@ DOCUMENT_SECONDS = 1.0
 COUNTER_SECONDS = 30.0
 COUNT_SECONDS = 10.0
 CHECK_SECONDS = 0.25
+CHECK_FAIL_OPEN_SECONDS = 60.0
 CHECK_BATCH_SIZE = 500
 MAX_CHECK_BATCHES = 20
 BACKOFF_START_SECONDS = 1.0
@@ -23,12 +24,13 @@ BATCH_SIZE = 250
 POLL_SECONDS = 0.5
 NO_BASE: IndexBase = (0, 0, None)
 Clock = Callable[[], float]
+FatalCallback = Callable[[], Any]
 
 
 # Parents: SearchIndexer.flush_documents
-# Keywords: document, absolute counters, base, files
-def build_document(snapshot: IndexSnapshot, base: IndexBase) -> Dict[str, Any]:
-    assert len(base) == 3
+# Keywords: document, counter deltas, files
+def build_document(snapshot: IndexSnapshot) -> Dict[str, Any]:
+    assert snapshot.metadata is not None
     metadata = snapshot.metadata
     result = {
         "info_hash": snapshot.info_hash.hex(),
@@ -38,27 +40,27 @@ def build_document(snapshot: IndexSnapshot, base: IndexBase) -> Dict[str, Any]:
         "piece_length": min(metadata.piece_length, MAX_SQLITE_INTEGER),
         "is_private": metadata.is_private,
         "fetched_at": metadata.fetched_at,
-        "seen_count": base[0] + snapshot.seen_count,
-        "announce_count": base[1] + snapshot.announce_count,
-        "first_seen": snapshot.first_seen if base[2] is None else min(base[2], snapshot.first_seen),
+        "seen_count": snapshot.seen_delta,
+        "announce_count": snapshot.announce_delta,
+        "first_seen": snapshot.first_seen,
         "last_seen": snapshot.last_seen,
         "files": [[item.path, item.length] for item in metadata.files],
     }
-    assert result["seen_count"] >= snapshot.seen_count
+    assert result["seen_count"] >= 0
     return result
 
 
 # Parents: SearchIndexer.flush_counters
-# Keywords: counter update, absolute counters, base
+# Keywords: counter update, deltas
 def build_counter_update(snapshot: IndexSnapshot) -> Dict[str, Any]:
     assert snapshot.base is not None
     result = {
         "info_hash": snapshot.info_hash.hex(),
-        "seen_count": snapshot.base[0] + snapshot.seen_count,
-        "announce_count": snapshot.base[1] + snapshot.announce_count,
+        "seen_delta": snapshot.seen_delta,
+        "announce_delta": snapshot.announce_delta,
         "last_seen": snapshot.last_seen,
     }
-    assert result["seen_count"] >= snapshot.seen_count
+    assert result["seen_delta"] >= 0
     return result
 
 
@@ -80,6 +82,7 @@ class SearchIndexer:
         batch_size: int = BATCH_SIZE,
         final_flush_seconds: float = FINAL_FLUSH_SECONDS,
         clock: Clock = time.monotonic,
+        on_fatal: Optional[FatalCallback] = None,
     ) -> None:
         assert document_seconds > 0 and counter_seconds > 0 and count_seconds > 0 and check_seconds > 0 and 0 < backoff_start <= backoff_max and batch_size >= 1
         self.catalog = catalog
@@ -93,6 +96,9 @@ class SearchIndexer:
         self.batch_size = batch_size
         self.final_flush_seconds = final_flush_seconds
         self.clock = clock
+        self.on_fatal = on_fatal
+        self.check_failing_since: Optional[float] = None
+        self.checks_bypassed = False
         self.stop_event = threading.Event()
         self.thread: Optional[threading.Thread] = None
         self.reader: Optional[sqlite3.Connection] = None
@@ -139,16 +145,22 @@ class SearchIndexer:
         return result
 
     # Parents: start (thread target)
-    # Keywords: loop, due work, backoff, final flush
+    # Keywords: loop, due work, backoff, final flush, fatal error
     def run(self) -> None:
         assert self.thread is not None
-        while not self.stop_event.is_set():
-            if self.clock() >= self.wake_at:
-                self.run_due_work()
-            self.stop_event.wait(max(0.0, min(self.wake_at - self.clock(), POLL_SECONDS)))
-        self.final_flush()
-        self.close_reader()
-        assert self.stop_event.is_set()
+        try:
+            while not self.stop_event.is_set():
+                if self.clock() >= self.wake_at:
+                    self.run_due_work()
+                self.stop_event.wait(max(0.0, min(self.wake_at - self.clock(), POLL_SECONDS)))
+            self.final_flush()
+        except BaseException as error:
+            LOGGER.critical("index thread stopped: %r", error, exc_info=error)
+            if self.on_fatal is not None:
+                self.on_fatal()
+        finally:
+            self.close_reader()
+        assert self.reader is None
 
     # Parents: flush_documents, flush_checks, run_due_work (index thread only)
     # Keywords: reader, reuse, warm cache
@@ -214,10 +226,8 @@ class SearchIndexer:
             if not batch:
                 return
             try:
-                unknown = [snapshot.info_hash.hex() for snapshot in batch if snapshot.base is None]
-                found = self.database.lookup_counters(unknown, self.thread_reader()) if unknown else {}
-                bases: List[IndexBase] = [snapshot.base if snapshot.base is not None else found.get(snapshot.info_hash.hex(), NO_BASE) for snapshot in batch]
-                self.database.write_documents([build_document(snapshot, base) for snapshot, base in zip(batch, bases)])
+                previous = self.database.write_documents([build_document(snapshot) for snapshot in batch])
+                bases: List[IndexBase] = [snapshot.base if snapshot.base is not None else previous.get(snapshot.info_hash.hex(), NO_BASE) for snapshot in batch]
             except sqlite3.Error:
                 self.catalog.requeue_index_documents(batch)
                 raise
@@ -228,8 +238,30 @@ class SearchIndexer:
         assert deadline is not None
 
     # Parents: run_due_work
-    # Keywords: database check, new hashes, known torrents, bounded batches
+    # Keywords: database check, new hashes, known torrents, bounded batches, fail open
     def flush_checks(self) -> None:
+        try:
+            if self.checks_bypassed:
+                self.database.document_totals(self.thread_reader())
+                self.catalog.set_database_check(True)
+                self.checks_bypassed = False
+                LOGGER.info("search database reachable again: database checks on again")
+            self.check_batches()
+        except Exception:
+            now = self.clock()
+            if self.check_failing_since is None:
+                self.check_failing_since = now
+            elif not self.checks_bypassed and now - self.check_failing_since >= CHECK_FAIL_OPEN_SECONDS:
+                self.catalog.set_database_check(False)
+                self.checks_bypassed = True
+                LOGGER.warning("database checks failing for %d s: switched off, fetching without them", CHECK_FAIL_OPEN_SECONDS)
+            raise
+        self.check_failing_since = None
+        assert not self.checks_bypassed
+
+    # Parents: flush_checks
+    # Keywords: database check, batches, apply results
+    def check_batches(self) -> None:
         for _ in range(MAX_CHECK_BATCHES):
             info_hashes = self.catalog.pending_database_checks(CHECK_BATCH_SIZE)
             if not info_hashes:
@@ -253,6 +285,8 @@ class SearchIndexer:
             except sqlite3.Error:
                 self.catalog.requeue_index_counters(batch)
                 raise
+            missing_set = set(missing)
+            self.catalog.mark_counters_written([snapshot for snapshot in batch if snapshot.info_hash.hex() not in missing_set])
             for info_hash in missing:
                 self.catalog.reset_index_base(bytes.fromhex(info_hash))
             with self.lock:
@@ -272,12 +306,12 @@ class SearchIndexer:
     # Keywords: error, count, log
     def record_error(self, error: Exception) -> None:
         assert isinstance(error, Exception)
-        with self.lock:
-            self.errors += 1
         if isinstance(error, sqlite3.Error):
             LOGGER.error("search database: %s", error)
         else:
             LOGGER.error("index thread error, retrying: %r", error, exc_info=error)
+        with self.lock:
+            self.errors += 1
 
     # Parents: ScraperRuntime.snapshot_stats, tests
     # Keywords: statistics, backlog, documents, errors
@@ -292,6 +326,7 @@ class SearchIndexer:
                 "index_dropped": backlog["dropped"],
                 "index_checked": self.checked,
                 "index_known": self.known,
+                "index_check_bypassed": self.checks_bypassed,
             }
             if self.documents is not None:
                 result["index_documents"] = self.documents

@@ -6,12 +6,14 @@ import sqlite3
 import threading
 import time
 import unittest
+from unittest import mock
 
 from dht_scraper.bencode_codec import encode_bencode
 from dht_scraper.krpc_messages import make_token
 from dht_scraper.metadata_fetcher import MetadataFetchError
 from dht_scraper.__main__ import main
 from dht_scraper.scraper_runtime import RuntimeSettings, ScraperRuntime
+from dht_scraper.search_indexer import SearchIndexer
 from dht_scraper.torrent_catalog import SOURCE_SAMPLE, TorrentCatalog
 from dht_scraper.torrent_database import TorrentDatabase
 from dht_scraper.torrent_info_summary import TorrentFile, TorrentMetadata
@@ -330,6 +332,45 @@ class ScraperRuntimeTest(unittest.TestCase):
                 self.assertEqual(self.get_json(runtime, "/api/stats")[1]["torrents_size"], 305)
             finally:
                 runtime.stop()
+
+    def test_RUNTIME_014_database_size(self):
+        with self.subTest(case="memory"):
+            runtime = self.make_runtime(settings(nodes=1, fetch_enabled=False))
+            runtime.start()
+            try:
+                self.assertNotIn("database_size", self.get_json(runtime, "/api/stats")[1])
+            finally:
+                runtime.stop()
+        with self.subTest(case="database"):
+            path = os.path.join(temporary_directory(self), "torrents.sqlite3")
+            seeded = open_database(self, [document(1, "one"), document(2, "two")], path=path)
+            seeded.close()
+            runtime = ScraperRuntime(settings(nodes=1, fetch_enabled=False, database_path=path), TorrentCatalog(), never_fetch, BOOTSTRAP, browser_opener=self.opened.append, indexer_options=FAST_INDEX)
+            runtime.start()
+            try:
+                def on_disk():
+                    return sum(os.path.getsize(name) for name in (path, path + "-wal") if os.path.exists(name))
+
+                self.assertTrue(wait_until(lambda: self.get_json(runtime, "/api/stats")[1].get("database_size") == on_disk(), timeout=3.0))
+                size = self.get_json(runtime, "/api/stats")[1]["database_size"]
+                self.assertIsInstance(size, int)
+                self.assertGreater(size, 0)
+            finally:
+                runtime.stop()
+
+    def test_RUNTIME_011_index_failure_exits_1(self):
+        path = os.path.join(temporary_directory(self), "torrents.sqlite3")
+
+        def broken(indexer):
+            raise MemoryError("injected")
+
+        started = time.monotonic()
+        with mock.patch.object(SearchIndexer, "run_due_work", broken), self.assertLogs("dht_scraper", level="INFO") as logs:
+            code = main(["--database", path, "--duration", "30", "--nodes", "1", "--port", "0", "--web-port", "0", "--no-browser", "--no-fetch"])
+        self.assertEqual(code, 1)
+        self.assertLess(time.monotonic() - started, 10.0)
+        self.assertIn("finished: reason=thread_failure", "\n".join(logs.output))
+        self.assertTrue(wait_until(lambda: project_threads() == []))
 
     def test_SEARCH_001_database_opened_at_start(self):
         with self.subTest(case="new"):

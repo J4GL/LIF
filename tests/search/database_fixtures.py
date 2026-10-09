@@ -53,6 +53,7 @@ class FailingDatabase:
     def __init__(self, database, failing=False):
         self.database = database
         self.failing = failing
+        self.fail_next = 0
         self.calls = []
         self.lock = threading.Lock()
 
@@ -66,6 +67,11 @@ class FailingDatabase:
                 self.calls.append((name, time.monotonic()))
             if isinstance(self.failing, BaseException):
                 raise self.failing
+            with self.lock:
+                fail_now = self.fail_next > 0
+                self.fail_next -= 1 if fail_now else 0
+            if fail_now:
+                raise sqlite3.OperationalError("disk I/O error (injected once)")
             if self.failing:
                 raise sqlite3.OperationalError("disk I/O error (injected)")
             return target(*args, **kwargs)

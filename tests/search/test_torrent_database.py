@@ -24,7 +24,7 @@ class TextTermsTest(unittest.TestCase):
 
 class TorrentDatabaseSpecTest(unittest.TestCase):
     def test_SEARCH_020_database_scenarios(self):
-        for scenario in (self.case_schema, self.case_tokens, self.case_typos, self.case_order, self.case_writes, self.case_lookup, self.case_detail, self.case_totals):
+        for scenario in (self.case_schema, self.case_tokens, self.case_typos, self.case_order, self.case_writes, self.case_lookup, self.case_detail, self.case_totals, self.case_catch_up):
             with self.subTest(case=scenario.__name__):
                 scenario()
 
@@ -84,15 +84,18 @@ class TorrentDatabaseSpecTest(unittest.TestCase):
 
     def case_writes(self):
         database = open_database(self, [document(1, "kept name", 1)])
-        database.write_documents([document(1, "changed", 5)])
+        previous = database.write_documents([document(1, "changed", 5, last_seen=0.8, first_seen=0.5)])
+        self.assertEqual(previous, {info_hash_hex(1): (1, 0, 1.0)})
+        stored = database.get_document(info_hash_hex(1))
+        self.assertEqual((stored["name"], stored["seen_count"], stored["first_seen"], stored["last_seen"]), ("kept name", 6, 0.5, 1.0))
         unknown = info_hash_hex(99)
         missing = database.update_counters([
-            {"info_hash": info_hash_hex(1), "seen_count": 42, "announce_count": 3, "last_seen": 5.0},
-            {"info_hash": unknown, "seen_count": 1, "announce_count": 0, "last_seen": 5.0},
+            {"info_hash": info_hash_hex(1), "seen_delta": 42, "announce_delta": 3, "last_seen": 5.0},
+            {"info_hash": unknown, "seen_delta": 1, "announce_delta": 0, "last_seen": 5.0},
         ])
         self.assertEqual(missing, [unknown])
         stored = database.get_document(info_hash_hex(1))
-        self.assertEqual((stored["name"], stored["seen_count"], stored["announce_count"], stored["last_seen"]), ("kept name", 42, 3, 5.0))
+        self.assertEqual((stored["name"], stored["seen_count"], stored["announce_count"], stored["last_seen"]), ("kept name", 48, 3, 5.0))
         self.assertEqual(names(database, "changed"), [])
 
     def case_lookup(self):
@@ -107,6 +110,35 @@ class TorrentDatabaseSpecTest(unittest.TestCase):
     def case_totals(self):
         database = open_database(self, [document(1, "big", lengths=[2 ** 62]), document(2, "bigger", lengths=[2 ** 62]), document(3, "small", lengths=[7])])
         self.assertEqual(database.document_totals(), (3, int(float(2 ** 63 + 7))))
+
+    def case_catch_up(self):
+        path = os.path.join(temporary_directory(self), "old.sqlite3")
+        database = TorrentDatabase(path)
+        database.open_writer()
+        database.write_documents([document(1, "ten", lengths=[10]), document(2, "twenty", lengths=[20])])
+        database.close()
+        connection = sqlite3.connect(path)
+        connection.execute("DROP TABLE totals")
+        connection.execute("CREATE INDEX torrents_size ON torrents (size)")
+        connection.commit()
+        connection.close()
+        database = TorrentDatabase(path)
+        self.assertFalse(database.open_writer())
+        self.assertEqual(database.document_totals(), (2, 30))
+        database.close()
+        connection = sqlite3.connect(path)
+        indexes = [row[0] for row in connection.execute("SELECT name FROM sqlite_master WHERE type = 'index'")]
+        connection.execute(
+            "INSERT INTO torrents (info_hash, name, size, file_count, piece_length, is_private, fetched_at, seen_count, announce_count, first_seen, last_seen, files_json) "
+            "VALUES (?, 'thirty', 30, 1, 16384, 0, 1.0, 1, 0, 1.0, 1.0, '[]')", (info_hash_hex(3),))
+        connection.commit()
+        connection.close()
+        self.assertNotIn("torrents_size", indexes)
+        database = TorrentDatabase(path)
+        database.open_writer()
+        self.assertEqual(database.document_totals(), (3, 60))
+        database.close()
+        self.assertEqual(user_version(path), 1)
 
     def case_detail(self):
         stored = document(7, "detail", files=["a/1.bin", "a/2.bin"], lengths=[7, 9])

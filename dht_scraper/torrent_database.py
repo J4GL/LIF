@@ -19,11 +19,28 @@ MAX_TYPO_TERMS = 20
 MAX_QUERY_TERMS = 16
 MAX_LOOKUP_PARAMETERS = 500
 MAX_SQLITE_INTEGER = 2 ** 63 - 1
-SIZE_INDEX_SQL = "CREATE INDEX IF NOT EXISTS torrents_size ON torrents (size)"
+TOTALS_SQL = """
+CREATE TABLE IF NOT EXISTS totals (id INTEGER PRIMARY KEY CHECK (id = 1), documents INTEGER NOT NULL, size REAL NOT NULL, last_id INTEGER NOT NULL);
+INSERT OR IGNORE INTO totals (id, documents, size, last_id) VALUES (1, 0, 0, 0);
+UPDATE totals SET
+    documents = documents + (SELECT count(*) FROM torrents WHERE id > totals.last_id),
+    size = size + (SELECT total(size) FROM torrents WHERE id > totals.last_id),
+    last_id = max(last_id, coalesce((SELECT max(id) FROM torrents), 0))
+WHERE id = 1;
+DROP INDEX IF EXISTS torrents_size;
+"""
 TERM_PATTERN = re.compile(r"[^\W_]+")
 DOCUMENT_COLUMNS = ("info_hash", "name", "size", "file_count", "piece_length", "is_private", "fetched_at", "seen_count", "announce_count", "first_seen", "last_seen")
 SEARCH_COLUMNS = ("info_hash", "name", "size", "file_count", "seen_count", "announce_count", "first_seen", "last_seen")
 RANK_ORDER = "t.seen_count DESC, t.last_seen DESC"
+SORT_EXPRESSIONS = {
+    "name": "name COLLATE NOCASE", "size": "size", "file_count": "file_count", "seen_count": "seen_count",
+    "announce_count": "announce_count", "last_seen": "last_seen",
+}
+SORT_INDEX_SQL = "".join(
+    "CREATE INDEX IF NOT EXISTS torrents_by_%s ON torrents (%s, seen_count, last_seen);\n" % (column, expression)
+    for column, expression in SORT_EXPRESSIONS.items() if column != "seen_count"
+)
 SCHEMA_SQL = """
 BEGIN;
 CREATE TABLE torrents (
@@ -42,7 +59,6 @@ CREATE TABLE torrents (
     files_json TEXT NOT NULL
 );
 CREATE INDEX torrents_rank ON torrents (seen_count DESC, last_seen DESC);
-CREATE INDEX torrents_size ON torrents (size);
 CREATE VIRTUAL TABLE torrents_fts USING fts5(name, files, content='', tokenize='unicode61 remove_diacritics 2');
 CREATE TABLE terms (variant TEXT NOT NULL, term TEXT NOT NULL, PRIMARY KEY (variant, term)) WITHOUT ROWID;
 PRAGMA user_version = 1;
@@ -134,6 +150,19 @@ def match_expression(terms: Sequence[str], alternatives: Optional[Sequence[Seque
     return result
 
 
+# Parents: TorrentDatabase.search, TorrentDatabase.run_match
+# Keywords: order by, sort column, direction, ties
+def order_clause(sort: Optional[str], descending: bool) -> str:
+    assert sort is None or sort in SORT_EXPRESSIONS
+    if sort is None:
+        return RANK_ORDER
+    direction = "DESC" if descending else "ASC"
+    expressions = [SORT_EXPRESSIONS[sort]] + [column for column in ("seen_count", "last_seen") if column != sort]
+    result = ", ".join("t.%s %s" % (expression, direction) for expression in expressions)
+    assert result.startswith("t.")
+    return result
+
+
 # Parents: TorrentDatabase.search
 # Keywords: search record, row, api shape
 def search_record(row: Sequence[Any]) -> Document:
@@ -200,7 +229,7 @@ class TorrentDatabase:
             created = version == 0
             if created:
                 connection.executescript(SCHEMA_SQL)
-            connection.execute(SIZE_INDEX_SQL)
+            connection.executescript("BEGIN IMMEDIATE;" + TOTALS_SQL + SORT_INDEX_SQL + "COMMIT;")
         except BaseException:
             connection.close()
             raise
@@ -215,6 +244,19 @@ class TorrentDatabase:
             self.writer.close()
             self.writer = None
         assert self.writer is None
+
+    # Parents: ScraperRuntime.snapshot_stats, tests
+    # Keywords: file size, wal, bytes on disk, missing file
+    def file_size(self) -> int:
+        assert self.path
+        result = 0
+        for name in (self.path, self.path + "-wal"):
+            try:
+                result += os.path.getsize(name)
+            except OSError:
+                pass
+        assert result >= 0
+        return result
 
     # Parents: search, get_document, lookup_counters, count_documents
     # Keywords: reader, never creates, query only, busy timeout
@@ -245,20 +287,23 @@ class TorrentDatabase:
         assert not self.writer.in_transaction
 
     # Parents: SearchIndexer.flush_documents, tests
-    # Keywords: write, insert text once, update counters, one transaction
-    def write_documents(self, documents: Sequence[Document]) -> None:
+    # Keywords: write, insert text once, counter deltas, previous counters, one transaction
+    def write_documents(self, documents: Sequence[Document]) -> Dict[str, Counters]:
         assert self.writer is not None and all(len(document["info_hash"]) == 40 for document in documents)
+        previous: Dict[str, Counters] = {}
         with self.transaction():
             for document in documents:
-                row = self.writer.execute("SELECT id FROM torrents WHERE info_hash = ?", (document["info_hash"],)).fetchone()
+                row = self.writer.execute("SELECT id, seen_count, announce_count, first_seen FROM torrents WHERE info_hash = ?", (document["info_hash"],)).fetchone()
                 if row is None:
                     self.insert_document(document)
                 else:
+                    previous[document["info_hash"]] = (row[1], row[2], row[3])
                     self.writer.execute(
-                        "UPDATE torrents SET seen_count = ?, announce_count = ?, first_seen = ?, last_seen = ? WHERE id = ?",
+                        "UPDATE torrents SET seen_count = seen_count + ?, announce_count = announce_count + ?, first_seen = min(first_seen, ?), last_seen = max(last_seen, ?) WHERE id = ?",
                         (document["seen_count"], document["announce_count"], document["first_seen"], document["last_seen"], row[0]),
                     )
-        assert self.writer is not None
+        assert len(previous) <= len(documents)
+        return previous
 
     # Parents: write_documents
     # Keywords: insert, fts row, typo terms, first 20 files
@@ -271,18 +316,19 @@ class TorrentDatabase:
         self.writer.execute("INSERT INTO torrents_fts (rowid, name, files) VALUES (?, ?, ?)", (cursor.lastrowid, document["name"], "\n".join(paths)))
         terms = text_terms(document["name"]) + [term for path in paths for term in text_terms(path)]
         self.writer.executemany("INSERT OR IGNORE INTO terms (variant, term) VALUES (?, ?)", term_rows(terms))
+        self.writer.execute("UPDATE totals SET documents = documents + 1, size = size + ?, last_id = max(last_id, ?) WHERE id = 1", (document["size"], cursor.lastrowid))
         assert cursor.lastrowid is not None
 
     # Parents: SearchIndexer.flush_counters, tests
-    # Keywords: counter update, missing rows, one transaction
+    # Keywords: counter deltas, missing rows, one transaction
     def update_counters(self, updates: Sequence[Document]) -> List[str]:
         assert self.writer is not None
         missing = []
         with self.transaction():
             for update in updates:
                 cursor = self.writer.execute(
-                    "UPDATE torrents SET seen_count = ?, announce_count = ?, last_seen = ? WHERE info_hash = ?",
-                    (update["seen_count"], update["announce_count"], update["last_seen"], update["info_hash"]),
+                    "UPDATE torrents SET seen_count = seen_count + ?, announce_count = announce_count + ?, last_seen = max(last_seen, ?) WHERE info_hash = ?",
+                    (update["seen_delta"], update["announce_delta"], update["last_seen"], update["info_hash"]),
                 )
                 if cursor.rowcount == 0:
                     missing.append(update["info_hash"])
@@ -319,11 +365,11 @@ class TorrentDatabase:
         return result
 
     # Parents: SearchIndexer.refresh_count, tests
-    # Keywords: count, total size, statistics, size index, no overflow
+    # Keywords: count, total size, statistics, totals row, no overflow
     def document_totals(self, reader: Optional[sqlite3.Connection] = None) -> Tuple[int, int]:
         connection = reader or self.connect_reader()
         try:
-            count, size = connection.execute("SELECT count(*), total(size) FROM torrents INDEXED BY torrents_size").fetchone()
+            count, size = connection.execute("SELECT documents, size FROM totals WHERE id = 1").fetchone()
         finally:
             if reader is None:
                 connection.close()
@@ -348,20 +394,22 @@ class TorrentDatabase:
         return result
 
     # Parents: CatalogRequestHandler.search_records, tests
-    # Keywords: search, tiers, typo tolerance, name first, popularity
-    def search(self, query: str, limit: int) -> List[Document]:
-        assert isinstance(query, str) and limit >= 1
+    # Keywords: search, tiers, typo tolerance, name first, popularity, sort
+    def search(self, query: str, limit: int, sort: Optional[str] = None, descending: bool = True) -> List[Document]:
+        assert isinstance(query, str) and limit >= 1 and (sort is None or sort in SORT_EXPRESSIONS)
         terms = text_terms(query)[:MAX_QUERY_TERMS]
         connection = self.connect_reader()
         try:
             if not terms:
-                rows = connection.execute("SELECT %s FROM torrents t ORDER BY %s LIMIT ?" % (", ".join("t." + column for column in SEARCH_COLUMNS), RANK_ORDER), (limit,)).fetchall()
+                rows = connection.execute("SELECT %s FROM torrents t ORDER BY %s LIMIT ?" % (", ".join("t." + column for column in SEARCH_COLUMNS), order_clause(sort, descending)), (limit,)).fetchall()
                 found = [search_record(row) for row in rows]
             else:
-                found = self.run_match(connection, match_expression(terms), limit)
+                found = self.run_match(connection, match_expression(terms), limit, sort, descending)
             if terms and len(found) < limit:
                 alternatives = [typo_terms(connection, term) for term in terms]
-                if any(alternatives):
+                if any(alternatives) and sort is not None:
+                    found = self.run_match(connection, match_expression(terms, alternatives), limit, sort, descending)
+                elif any(alternatives):
                     known = {record["info_hash"] for record in found}
                     extra = self.run_match(connection, match_expression(terms, alternatives), limit)
                     found += [record for record in extra if record["info_hash"] not in known][:limit - len(found)]
@@ -371,14 +419,20 @@ class TorrentDatabase:
         return found
 
     # Parents: search
-    # Keywords: fts5 match, name first, ranking, limit
-    def run_match(self, connection: sqlite3.Connection, expression: str, limit: int) -> List[Document]:
+    # Keywords: fts5 match, name first, ranking, sort, limit
+    def run_match(self, connection: sqlite3.Connection, expression: str, limit: int, sort: Optional[str] = None, descending: bool = True) -> List[Document]:
         assert expression and limit >= 1
-        query = (
-            "SELECT %s FROM torrents t WHERE t.id IN (SELECT rowid FROM torrents_fts WHERE torrents_fts MATCH ?) "
-            "ORDER BY (t.id IN (SELECT rowid FROM torrents_fts WHERE torrents_fts MATCH ?)) DESC, %s LIMIT ?"
-        ) % (", ".join("t." + column for column in SEARCH_COLUMNS), RANK_ORDER)
-        rows = connection.execute(query, (expression, "name : (%s)" % expression, limit)).fetchall()
+        columns = ", ".join("t." + column for column in SEARCH_COLUMNS)
+        if sort is None:
+            query = (
+                "SELECT %s FROM torrents t WHERE t.id IN (SELECT rowid FROM torrents_fts WHERE torrents_fts MATCH ?) "
+                "ORDER BY (t.id IN (SELECT rowid FROM torrents_fts WHERE torrents_fts MATCH ?)) DESC, %s LIMIT ?"
+            ) % (columns, RANK_ORDER)
+            parameters: Tuple[Any, ...] = (expression, "name : (%s)" % expression, limit)
+        else:
+            query = "SELECT %s FROM torrents t WHERE t.id IN (SELECT rowid FROM torrents_fts WHERE torrents_fts MATCH ?) ORDER BY %s LIMIT ?" % (columns, order_clause(sort, descending))
+            parameters = (expression, limit)
+        rows = connection.execute(query, parameters).fetchall()
         result = [search_record(row) for row in rows]
         assert len(result) <= limit
         return result

@@ -7,9 +7,9 @@ from dht_scraper.search_indexer import SearchIndexer
 from dht_scraper.torrent_catalog import SOURCE_SAMPLE, TorrentCatalog
 from dht_scraper.torrent_info_summary import TorrentFile, TorrentMetadata
 from tests.search.database_fixtures import FailingDatabase, document, info_hash_hex, open_database
-from tests.shared_fixtures import wait_until
+from tests.shared_fixtures import FakeClock, wait_until
 
-STAT_KEYS = ["index_backlog", "index_checked", "index_documents", "index_dropped", "index_errors", "index_known", "index_total_size", "index_updates", "index_upserts"]
+STAT_KEYS = ["index_backlog", "index_check_bypassed", "index_checked", "index_documents", "index_dropped", "index_errors", "index_known", "index_total_size", "index_updates", "index_upserts"]
 FAST = {"document_seconds": 0.05, "counter_seconds": 0.05, "count_seconds": 0.05}
 
 
@@ -43,8 +43,10 @@ class SearchIndexerSpecTest(IndexerTestCase):
             for number in (1, 2):
                 for moment in (101.0, 102.0, 103.0):
                     self.catalog.record_hash(bytes.fromhex(info_hash_hex(number)), SOURCE_SAMPLE, now=moment)
-            indexer = self.make_indexer(database)
+            recorder = FailingDatabase(database)
+            indexer = self.make_indexer(recorder)
             indexer.flush_documents()
+            self.assertNotIn("lookup_counters", recorder.call_names())
             row_a, row_b = database.get_document(info_hash_hex(1)), database.get_document(info_hash_hex(2))
             self.assertEqual((row_a["seen_count"], row_a["announce_count"], row_a["first_seen"]), (13, 2, 5.0))
             self.assertEqual(row_a["name"], "old A")
@@ -117,10 +119,10 @@ class SearchIndexerSpecTest(IndexerTestCase):
         self.assertTrue(wait_until(lambda: database.database.count_documents() == 51, timeout=2.0))
         self.assertTrue(wait_until(lambda: indexer.snapshot_counts()["index_backlog"] == 0, timeout=2.0))
         errors = indexer.snapshot_counts()["index_errors"]
-        database.failing = ValueError("unexpected (injected)")
         with self.assertLogs("dht_scraper", level="ERROR") as logs:
+            database.failing = ValueError("unexpected (injected)")
             self.assertTrue(wait_until(lambda: indexer.snapshot_counts()["index_errors"] > errors, timeout=2.0))
-        self.assertTrue(any("unexpected (injected)" in line for line in logs.output))
+        self.assertTrue(any("unexpected (injected)" in line for line in logs.output), logs.output)
         database.failing = False
         self.catalog.store_metadata(metadata(60, "after"))
         self.assertTrue(wait_until(lambda: database.database.get_document(info_hash_hex(60)) is not None, timeout=2.0))
@@ -199,6 +201,100 @@ class SearchIndexerSpecTest(IndexerTestCase):
         self.assertGreaterEqual(indexer.snapshot_counts()["index_errors"], 1)
         database.failing = False
         self.assertTrue(wait_until(lambda: hash_v in candidates(), timeout=2.0))
+
+
+    def test_SEARCH_008_failing_checks_switched_off(self):
+        peer = ("1.2.3.4", 6881)
+        hash_u, hash_v, hash_w = (bytes.fromhex(info_hash_hex(number)) for number in (21, 22, 23))
+        catalog = TorrentCatalog()
+        catalog.enable_index_tracking(check_database=True)
+        self.catalog = catalog
+        clock = FakeClock(0.0)
+        database = FailingDatabase(open_database(self), failing=True)
+        indexer = self.make_indexer(database, clock=clock, check_seconds=0.05, backoff_start=0.05, backoff_max=0.1, **FAST)
+
+        def fetchable():
+            found = [info_hash for info_hash, _ in catalog.next_fetch_candidates(10)]
+            for info_hash in found:
+                catalog.release_fetch_claim(info_hash)
+            return found
+
+        def advance_until(condition):
+            def step():
+                clock.now += 0.05
+                return condition()
+            return wait_until(step, timeout=2.0)
+
+        catalog.record_hash(hash_u, SOURCE_SAMPLE, peer)
+        with self.assertLogs("dht_scraper", level="INFO") as logs:
+            indexer.start()
+            while clock.now < 59.0:
+                clock.now = min(59.0, clock.now + 1.0)
+                time.sleep(0.01)
+            time.sleep(0.2)
+            self.assertEqual(catalog.pending_database_checks(10), [hash_u])
+            self.assertEqual(fetchable(), [])
+            self.assertFalse(indexer.snapshot_counts()["index_check_bypassed"])
+            clock.now = 61.0
+            self.assertTrue(advance_until(lambda: indexer.snapshot_counts()["index_check_bypassed"]))
+            self.assertEqual(fetchable(), [hash_u])
+            catalog.record_hash(hash_v, SOURCE_SAMPLE, peer)
+            self.assertIn(hash_v, fetchable())
+            database.failing = False
+            self.assertTrue(advance_until(lambda: not indexer.snapshot_counts()["index_check_bypassed"]))
+            catalog.record_hash(hash_w, SOURCE_SAMPLE, peer)
+            self.assertNotIn(hash_w, fetchable())
+            self.assertTrue(advance_until(lambda: hash_w in fetchable()))
+        self.assertTrue(any(line.startswith("WARNING") and "switched off" in line for line in logs.output), logs.output)
+        self.assertTrue(any(line.startswith("INFO") and "on again" in line for line in logs.output), logs.output)
+
+    def test_SEARCH_009_fatal_error_reported(self):
+        calls = []
+        indexer = self.make_indexer(open_database(self), on_fatal=lambda: calls.append(1))
+
+        def broken():
+            raise MemoryError("injected")
+
+        indexer.run_due_work = broken
+        with self.assertLogs("dht_scraper", level="CRITICAL") as logs:
+            indexer.start()
+            self.assertTrue(indexer.join(2.0))
+        self.assertEqual(calls, [1])
+        self.assertTrue(any("MemoryError" in line for line in logs.output), logs.output)
+
+    def test_SEARCH_030_sightings_counted_once(self):
+        catalog = TorrentCatalog(max_entries=3)
+        catalog.enable_index_tracking(check_database=True)
+        hash_k, hash_b, hash_c, hash_d = (bytes.fromhex(info_hash_hex(number)) for number in (31, 32, 33, 34))
+        database = FailingDatabase(open_database(self, [document(31, "Known", seen_count=10)]))
+        indexer = SearchIndexer(catalog, database)
+        self.addCleanup(indexer.close_reader)
+        seen = lambda: database.database.get_document(info_hash_hex(31))["seen_count"]
+        catalog.record_hash(hash_k, SOURCE_SAMPLE)
+        catalog.record_hash(hash_k, SOURCE_SAMPLE)
+        indexer.flush_checks()
+        indexer.flush_counters()
+        self.assertEqual(seen(), 12)
+        catalog.record_hash(hash_k, SOURCE_SAMPLE)
+        for _ in range(3):
+            catalog.record_hash(hash_b, SOURCE_SAMPLE)
+            catalog.record_hash(hash_c, SOURCE_SAMPLE)
+        catalog.record_hash(hash_d, SOURCE_SAMPLE, ("1.2.3.4", 6881))
+        self.assertIsNone(catalog.torrent_detail(hash_k))
+        catalog.record_hash(hash_k, SOURCE_SAMPLE, ("1.2.3.4", 6881))
+        indexer.flush_checks()
+        catalog.record_hash(hash_k, SOURCE_SAMPLE)
+        indexer.flush_counters()
+        self.assertEqual(seen(), 15)
+        indexer.flush_counters()
+        self.assertEqual(seen(), 15)
+        catalog.record_hash(hash_k, SOURCE_SAMPLE)
+        database.fail_next = 1
+        with self.assertRaises(sqlite3.OperationalError):
+            indexer.flush_counters()
+        indexer.flush_counters()
+        indexer.flush_counters()
+        self.assertEqual(seen(), 16)
 
 
 if __name__ == "__main__":

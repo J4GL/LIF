@@ -34,6 +34,8 @@ SQLite file that answers the searches, tolerates typos and survives restarts.
 - Retries with message stream encryption (RC4) a peer that closes on the plaintext handshake,
   and tries uTP (BEP 29) on a peer that refuses TCP.
 - Serves a web page with live stats, search and a detail view, and opens it in your browser.
+  Click a column header (Name, Size, Files, Seen, Announces, Last seen) to sort the results;
+  click again to reverse. The API takes `sort` and `order` (`/api/search?q=&sort=size&order=desc`).
 - With `--database`, keeps torrents with metadata in SQLite (FTS5) and searches them with one typo
   allowed per word of 4 letters or more (`debain` finds `Debian`).
 
@@ -292,7 +294,11 @@ more hashes for about 20 % more traffic.
 - Inbound UDP is needed for the passive path (other nodes announcing to us).
 - Without `--database` everything is lost on exit, and the catalog is capped at 250 000 hashes.
   With it, metadata leaves memory once written to SQLite, and a hash already in the database is
-  recognized (one indexed lookup per new hash) and never fetched again.
+  recognized (one indexed lookup per new hash) and never fetched again. Sightings are added to the
+  stored counters as deltas, so none is lost when an entry is evicted. If the database fails, a
+  search is retried once and then answered 503 (the page says so); if the database checks fail
+  for 60 s the scraper fetches without them, and if the index thread dies the program exits with
+  1 so Docker restarts it.
 - `seen_count` is a rough popularity signal, not a swarm size.
 - Most peers cannot be reached: about 60 % of TCP connects time out (NAT, firewall, offline) and
   15 % are refused. About 6 % of connection attempts end with verified metadata.

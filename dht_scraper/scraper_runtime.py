@@ -152,6 +152,7 @@ class ScraperRuntime:
         self.indexer: Optional[SearchIndexer] = None
         self.database: Optional[TorrentDatabase] = None
         self.terminate_requested = False
+        self.stop_reason: Optional[str] = None
         self.start_time = time.monotonic()
         self.last_summary_time = self.start_time
         self.stopped = False
@@ -196,7 +197,7 @@ class ScraperRuntime:
         self.database = database
         LOGGER.info("search database %s %s", "created" if created else "opened", self.settings.database_path)
         self.catalog.enable_index_tracking(check_database=True)
-        self.indexer = SearchIndexer(self.catalog, database, **self.indexer_options)
+        self.indexer = SearchIndexer(self.catalog, database, on_fatal=self.stop_event.set, **self.indexer_options)
         self.indexer.start()
         assert self.indexer.thread is not None
 
@@ -343,6 +344,8 @@ class ScraperRuntime:
             stats["torrents"], stats["torrents_size"] = stats["index_documents"], stats["index_total_size"]
         elif self.indexer is None:
             stats["torrents"], stats["torrents_size"] = stats["with_metadata"], stats["metadata_bytes"]
+        if self.database is not None:
+            stats["database_size"] = self.database.file_size()
         assert "hashes_seen" in stats and "uptime_seconds" in stats
         return stats
 
@@ -378,6 +381,7 @@ class ScraperRuntime:
         try:
             self.start()
             reason = self.wait_until_stopped(duration)
+            self.stop_reason = reason
             self.stop()
         finally:
             if in_main_thread:

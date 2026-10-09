@@ -24,11 +24,16 @@ INDEX_PAGE_HTML = """<!DOCTYPE html>
   table { width: 100%; border-collapse: collapse; }
   th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--line); vertical-align: top; }
   thead th { position: sticky; top: 0; background: Canvas; }
+  thead th button { all: unset; cursor: pointer; font-weight: bold; }
+  thead th button:focus-visible { outline: 2px solid var(--accent); }
   tbody tr { cursor: pointer; }
   tbody tr:hover { background: #8882; }
   td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
   td.name { word-break: break-word; }
   a { color: var(--accent); }
+  #tooltip { position: fixed; z-index: 10; pointer-events: none; transform: translate(-50%, -100%); padding: 3px 7px; border-radius: 4px; background: #222; color: #fff; font-size: 12px; white-space: nowrap; font-variant-numeric: tabular-nums; }
+  #tooltip.below { transform: translate(-50%, 0); }
+  #tooltip[hidden] { display: none; }
   #detail { border: 1px solid var(--line); border-radius: 6px; padding: 12px; align-self: start; position: sticky; top: 12px; }
   #detail h2 { margin: 0 0 8px; font-size: 16px; word-break: break-word; }
   code { font-size: 12px; word-break: break-all; }
@@ -47,6 +52,7 @@ INDEX_PAGE_HTML = """<!DOCTYPE html>
       <span>uptime <b data-stat="uptime_seconds">0</b></span>
       <span>torrents <b data-stat="torrents">-</b></span>
       <span>total size <b data-stat="torrents_size">-</b></span>
+      <span>database size <b data-stat="database_size">-</b></span>
     </div>
     <button id="stats-toggle" type="button" aria-controls="stats-more" aria-expanded="false" title="all statistics">&gt;&gt;</button>
     <div id="stats-more" hidden>
@@ -73,7 +79,7 @@ INDEX_PAGE_HTML = """<!DOCTYPE html>
       <button type="submit">Search</button>
     </form>
     <table id="results">
-      <thead><tr><th>Name</th><th class="num">Size</th><th class="num">Files</th><th class="num">Seen</th><th class="num">Announces</th><th class="num">Last seen</th><th>Magnet</th></tr></thead>
+      <thead><tr><th data-sort="name"><button type="button">Name</button></th><th class="num" data-sort="size"><button type="button">Size</button></th><th class="num" data-sort="file_count"><button type="button">Files</button></th><th class="num" data-sort="seen_count"><button type="button">Seen</button></th><th class="num" data-sort="announce_count"><button type="button">Announces</button></th><th class="num" data-sort="last_seen"><button type="button">Last seen</button></th><th>Magnet</th></tr></thead>
       <tbody></tbody>
     </table>
     <p id="empty" class="muted" hidden>No fetched torrents match yet. Metadata arrives as peers answer.</p>
@@ -88,11 +94,15 @@ INDEX_PAGE_HTML = """<!DOCTYPE html>
     <div id="files"><table><thead><tr><th>Path</th><th class="num">Length</th></tr></thead><tbody id="detail-files"></tbody></table></div>
   </aside>
 </main>
+<div id="tooltip" role="tooltip" hidden></div>
 <script>
 (function () {
   "use strict";
   var MAGNET_PREFIX = "magnet:?xt=urn:btih:";
+  var EMPTY_MESSAGE = "No fetched torrents match yet. Metadata arrives as peers answer.";
+  var UNAVAILABLE_MESSAGE = "Search database unavailable, retrying\u2026";
   var searchTimer = null;
+  var sortState = { sort: null, order: null };
 
   function clearChildren(element) { while (element.firstChild) { element.removeChild(element.firstChild); } }
   function formatBytes(n) {
@@ -100,12 +110,26 @@ INDEX_PAGE_HTML = """<!DOCTYPE html>
     while (v >= 1024 && i < units.length - 1) { v /= 1024; i += 1; }
     return (i === 0 ? v : v.toFixed(1)) + " " + units[i];
   }
+  function formatCount(n) {
+    var units = ["", "k", "M", "B", "T"]; var v = Math.round(Number(n) || 0);
+    if (Math.abs(v) < 1000) { return String(v); }
+    var scaled = v / 1000; var i = 1;
+    while (Math.round(scaled * 10) / 10 >= 1000 && i < units.length - 1) { scaled /= 1000; i += 1; }
+    return String(Math.round(scaled * 10) / 10) + units[i];
+  }
+  function formatFull(n) { return String(Math.round(Number(n) || 0)).replace(/\\B(?=(\\d{3})+(?!\\d))/g, " "); }
+  function setCount(element, value) {
+    var short = formatCount(value); var full = formatFull(value);
+    element.textContent = short;
+    if (short === full) { element.removeAttribute("data-full"); } else { element.setAttribute("data-full", full); }
+  }
   function formatDuration(seconds) {
     var s = Math.max(0, Math.round(Number(seconds) || 0)); var d = Math.floor(s / 86400); var h = Math.floor(s % 86400 / 3600); var m = Math.floor(s % 3600 / 60);
     return (d ? d + "d " : "") + (d || h ? h + "h " : "") + (d || h || m ? m + "m " : "") + (s % 60) + "s";
   }
   function formatTime(unix) { return unix ? new Date(unix * 1000).toLocaleTimeString() : "-"; }
   function cell(row, text, cls) { var td = document.createElement("td"); td.textContent = text; if (cls) { td.className = cls; } row.appendChild(td); return td; }
+  function countCell(row, value) { var td = document.createElement("td"); td.className = "num"; setCount(td, value); row.appendChild(td); return td; }
   function fetchJson(url) { return fetch(url, { cache: "no-store" }).then(function (r) { return r.json(); }); }
 
   function refreshStats() {
@@ -113,18 +137,23 @@ INDEX_PAGE_HTML = """<!DOCTYPE html>
       var spans = document.querySelectorAll("[data-stat]");
       for (var i = 0; i < spans.length; i += 1) {
         var key = spans[i].getAttribute("data-stat"); var value = stats[key];
-        spans[i].textContent = value === undefined ? "-" : (key === "uptime_seconds" ? formatDuration(value) : key === "torrents_size" ? formatBytes(value) : String(value));
+        if (value === undefined) { spans[i].textContent = "-"; spans[i].removeAttribute("data-full"); }
+        else if (key === "uptime_seconds") { spans[i].textContent = formatDuration(value); }
+        else if (key === "torrents_size" || key === "database_size") { spans[i].textContent = formatBytes(value); }
+        else { setCount(spans[i], value); }
       }
     }).catch(function () {});
   }
 
-  function renderResults(results) {
+  function renderResults(results, message) {
     var body = document.querySelector("#results tbody"); clearChildren(body);
-    document.getElementById("empty").hidden = results.length > 0;
+    var empty = document.getElementById("empty");
+    empty.textContent = message || EMPTY_MESSAGE;
+    empty.hidden = results.length > 0;
     results.forEach(function (item) {
       var tr = document.createElement("tr"); tr.dataset.hash = item.info_hash;
-      cell(tr, item.name, "name"); cell(tr, formatBytes(item.size), "num"); cell(tr, String(item.file_count), "num");
-      cell(tr, String(item.seen_count), "num"); cell(tr, String(item.announce_count), "num"); cell(tr, formatTime(item.last_seen), "num");
+      cell(tr, item.name, "name"); cell(tr, formatBytes(item.size), "num"); countCell(tr, item.file_count);
+      countCell(tr, item.seen_count); countCell(tr, item.announce_count); cell(tr, formatTime(item.last_seen), "num");
       var td = document.createElement("td"); var a = document.createElement("a"); a.textContent = "magnet";
       if (typeof item.magnet === "string" && item.magnet.indexOf(MAGNET_PREFIX) === 0) { a.href = item.magnet; }
       a.addEventListener("click", function (event) { event.stopPropagation(); });
@@ -136,7 +165,10 @@ INDEX_PAGE_HTML = """<!DOCTYPE html>
 
   function runSearch() {
     var q = document.getElementById("query").value; var limit = document.getElementById("limit").value || "20";
-    fetchJson("/api/search?q=" + encodeURIComponent(q) + "&limit=" + encodeURIComponent(limit)).then(function (payload) { renderResults(payload.results || []); }).catch(function () {});
+    var sortPart = sortState.sort ? "&sort=" + encodeURIComponent(sortState.sort) + "&order=" + encodeURIComponent(sortState.order) : "";
+    fetchJson("/api/search?q=" + encodeURIComponent(q) + "&limit=" + encodeURIComponent(limit) + sortPart).then(function (payload) {
+      if (payload.error) { renderResults([], UNAVAILABLE_MESSAGE); } else { renderResults(payload.results || []); }
+    }).catch(function () {});
   }
 
   function addField(dl, label, value) {
@@ -163,8 +195,47 @@ INDEX_PAGE_HTML = """<!DOCTYPE html>
     panel.hidden = false;
   }
 
+  var tooltip = document.getElementById("tooltip");
+  function showTooltip(target) {
+    var r = target.getBoundingClientRect(); var below = r.top < 40;
+    tooltip.textContent = target.getAttribute("data-full"); tooltip.className = below ? "below" : "";
+    tooltip.style.left = (r.left + r.width / 2) + "px"; tooltip.style.top = (below ? r.bottom + 6 : r.top - 6) + "px";
+    tooltip.hidden = false;
+  }
+  function fullTarget(event) { return event.target && event.target.closest ? event.target.closest("[data-full]") : null; }
+  document.addEventListener("mouseover", function (event) { var target = fullTarget(event); if (target) { showTooltip(target); } });
+  document.addEventListener("mouseout", function (event) { if (fullTarget(event)) { tooltip.hidden = true; } });
+
   function loadDetail(hash) { fetchJson("/api/torrent/" + encodeURIComponent(hash)).then(function (detail) { if (!detail.error) { renderDetail(detail); } }).catch(function () {}); }
 
+  function showSort() {
+    var headers = document.querySelectorAll("#results thead th[data-sort]");
+    for (var i = 0; i < headers.length; i += 1) {
+      var key = headers[i].getAttribute("data-sort"); var button = headers[i].querySelector("button");
+      button.textContent = button.textContent.replace(/ [\u25b2\u25bc]$/, "");
+      if (key === sortState.sort) {
+        headers[i].setAttribute("aria-sort", sortState.order === "asc" ? "ascending" : "descending");
+        button.textContent += sortState.order === "asc" ? " \u25b2" : " \u25bc";
+      } else {
+        headers[i].removeAttribute("aria-sort");
+      }
+    }
+  }
+  function readSortFromAddress() {
+    var match = /^#sort=([a-z_]+)&order=(asc|desc)$/.exec(location.hash);
+    if (match && document.querySelector('#results thead th[data-sort="' + match[1] + '"]')) { sortState = { sort: match[1], order: match[2] }; }
+    showSort();
+  }
+  function sortBy(key) {
+    var order = key === sortState.sort ? (sortState.order === "asc" ? "desc" : "asc") : (key === "name" ? "asc" : "desc");
+    sortState = { sort: key, order: order };
+    history.replaceState(null, "", "#sort=" + key + "&order=" + order);
+    showSort(); runSearch();
+  }
+  Array.prototype.forEach.call(document.querySelectorAll("#results thead th[data-sort] button"), function (button) {
+    button.addEventListener("click", function () { sortBy(button.parentNode.getAttribute("data-sort")); });
+  });
+  readSortFromAddress();
   document.getElementById("search-form").addEventListener("submit", function (event) { event.preventDefault(); runSearch(); });
   document.getElementById("query").addEventListener("input", function () { clearTimeout(searchTimer); searchTimer = setTimeout(runSearch, 300); });
   document.getElementById("stats-toggle").addEventListener("click", function () {

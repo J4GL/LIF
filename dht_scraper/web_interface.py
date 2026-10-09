@@ -4,7 +4,6 @@ import json
 import logging
 import sqlite3
 import string
-import threading
 import time
 import urllib.parse
 from typing import Any, Callable, Dict, List, Optional, Tuple
@@ -24,14 +23,15 @@ MAX_SEARCH_LIMIT = 200
 MAX_QUERY_LENGTH = 200
 ROUTE_TORRENT_PREFIX = "/api/torrent/"
 SERVER_POLL_SECONDS = 0.5
-INDEX_PAUSE_SECONDS = 30.0
+DATABASE_RETRY_SECONDS = 0.1
+SORT_COLUMNS = ("name", "size", "file_count", "seen_count", "announce_count", "last_seen")
+DATABASE_UNAVAILABLE = "search database unavailable"
 ENGINE_SQLITE = "sqlite"
 ENGINE_MEMORY = "memory"
 CONTENT_JSON = "application/json; charset=utf-8"
 CONTENT_HTML = "text/html; charset=utf-8"
 CONTENT_SECURITY_POLICY = "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'self'"
 StatsProvider = Callable[[], Dict[str, Any]]
-Clock = Callable[[], float]
 Response = Tuple[int, str, bytes]
 
 
@@ -48,6 +48,21 @@ def parse_search_query(query_string: str) -> Tuple[str, int]:
     limit = max(1, min(limit, MAX_SEARCH_LIMIT))
     assert 1 <= limit <= MAX_SEARCH_LIMIT and len(query) <= MAX_QUERY_LENGTH
     return query, limit
+
+
+# Parents: CatalogRequestHandler.render_search
+# Keywords: sort, order, column, default direction, parse
+def parse_sort(query_string: str) -> Tuple[Optional[str], str]:
+    assert isinstance(query_string, str)
+    fields = urllib.parse.parse_qs(query_string, keep_blank_values=True)
+    sort: Optional[str] = fields.get("sort", [""])[0]
+    if sort not in SORT_COLUMNS:
+        sort = None
+    order = fields.get("order", [""])[0]
+    if order not in ("asc", "desc"):
+        order = "asc" if sort == "name" else "desc"
+    assert order in ("asc", "desc")
+    return sort, order
 
 
 # Parents: CatalogRequestHandler.render_torrent
@@ -103,38 +118,31 @@ class CatalogWebServer(http.server.ThreadingHTTPServer):
         catalog: TorrentCatalog,
         stats_provider: StatsProvider,
         database: Optional[TorrentDatabase] = None,
-        clock: Clock = time.monotonic,
+        retry_delay: float = DATABASE_RETRY_SECONDS,
     ) -> None:
-        assert len(address) == 2 and callable(stats_provider)
+        assert len(address) == 2 and callable(stats_provider) and retry_delay >= 0
         self.catalog = catalog
         self.stats_provider = stats_provider
         self.database = database
-        self.clock = clock
-        self.index_lock = threading.Lock()
-        self.index_paused_until = float("-inf")
+        self.retry_delay = retry_delay
         super().__init__(address, CatalogRequestHandler)
         assert self.server_address[1] > 0
 
     # Parents: CatalogRequestHandler.search_records, CatalogRequestHandler.render_torrent
-    # Keywords: search index, pause, available
-    def index_available(self) -> bool:
-        assert self.index_lock is not None
-        with self.index_lock:
-            result = self.database is not None and self.clock() >= self.index_paused_until
-        assert isinstance(result, bool)
+    # Keywords: database read, retry once, unavailable, warning
+    def read_database(self, read: Callable[[TorrentDatabase], Any]) -> Tuple[bool, Any]:
+        assert self.database is not None
+        for attempt in range(2):
+            try:
+                return True, read(self.database)
+            except sqlite3.Error as error:
+                if attempt == 0:
+                    time.sleep(self.retry_delay)
+                else:
+                    LOGGER.warning("search database unavailable: %s", error)
+        result = (False, None)
+        assert result[0] is False
         return result
-
-    # Parents: CatalogRequestHandler.search_records, CatalogRequestHandler.render_torrent
-    # Keywords: search index, failure, pause, warning
-    def pause_index(self, error: sqlite3.Error) -> None:
-        assert isinstance(error, sqlite3.Error)
-        if is_transient_error(error):
-            LOGGER.warning("search index busy, this request uses memory: %s", error)
-            return
-        with self.index_lock:
-            self.index_paused_until = self.clock() + INDEX_PAUSE_SECONDS
-        LOGGER.warning("search index unavailable, searching memory for %d s: %s", INDEX_PAUSE_SECONDS, error)
-        assert self.index_paused_until > float("-inf")
 
 
 class CatalogRequestHandler(http.server.BaseHTTPRequestHandler):
@@ -182,23 +190,25 @@ class CatalogRequestHandler(http.server.BaseHTTPRequestHandler):
     def render_search(self, query_string: str) -> Response:
         assert isinstance(query_string, str)
         query, limit = parse_search_query(query_string)
-        engine, records = self.search_records(query, limit)
+        sort, order = parse_sort(query_string)
+        engine, records = self.search_records(query, limit, sort, order == "desc")
+        if records is None:
+            return self.render_error(503, DATABASE_UNAVAILABLE)
         results = [attach_magnet(record, record["name"]) for record in records]
-        result = (200, CONTENT_JSON, encode_json({"query": query, "limit": limit, "count": len(results), "engine": engine, "results": results}))
+        payload = {"query": query, "limit": limit, "count": len(results), "engine": engine, "sort": sort, "order": order, "results": results}
+        result = (200, CONTENT_JSON, encode_json(payload))
         assert result[0] == 200
         return result
 
     # Parents: render_search
-    # Keywords: search, database first, memory fallback
-    def search_records(self, query: str, limit: int) -> Tuple[str, List[Dict[str, Any]]]:
+    # Keywords: search, database when configured, memory without one, retry once
+    def search_records(self, query: str, limit: int, sort: Optional[str] = None, descending: bool = True) -> Tuple[str, Optional[List[Dict[str, Any]]]]:
         assert 1 <= limit <= MAX_SEARCH_LIMIT
-        if self.server.index_available():
-            try:
-                return ENGINE_SQLITE, self.server.database.search(query, limit)
-            except sqlite3.Error as error:
-                self.server.pause_index(error)
-        result = (ENGINE_MEMORY, self.server.catalog.search(query, limit))
-        assert len(result[1]) <= limit
+        if self.server.database is None:
+            return ENGINE_MEMORY, self.server.catalog.search(query, limit, sort, descending)
+        found, records = self.server.read_database(lambda database: database.search(query, limit, sort, descending))
+        result = (ENGINE_SQLITE, records if found else None)
+        assert result[1] is None or len(result[1]) <= limit
         return result
 
     # Parents: dispatch
@@ -209,19 +219,13 @@ class CatalogRequestHandler(http.server.BaseHTTPRequestHandler):
         if info_hash is None:
             return self.render_error(400, "invalid info hash")
         record = self.server.catalog.torrent_detail(info_hash)
-        index_failed = False
+        database_failed = False
         if (record is None or record["metadata"] is None) and self.server.database is not None:
-            if self.server.index_available():
-                try:
-                    document = self.server.database.get_document(info_hash.hex())
-                    record = record if document is None else document_detail_record(document)
-                except sqlite3.Error as error:
-                    self.server.pause_index(error)
-                    index_failed = True
-            else:
-                index_failed = True
+            found, document = self.server.read_database(lambda database: database.get_document(info_hash.hex()))
+            database_failed = not found
+            record = document_detail_record(document) if document is not None else record
         if record is None:
-            return self.render_error(503, "search index unavailable") if index_failed else self.render_error(404, "not found")
+            return self.render_error(503, DATABASE_UNAVAILABLE) if database_failed else self.render_error(404, "not found")
         name = record["metadata"]["name"] if record.get("metadata") else ""
         result = (200, CONTENT_JSON, encode_json(attach_magnet(record, name)))
         assert result[0] == 200
@@ -257,16 +261,6 @@ class CatalogRequestHandler(http.server.BaseHTTPRequestHandler):
         level = logging.DEBUG if "/api/stats" in getattr(self, "path", "") else logging.INFO
         LOGGER.log(level, "web %s %s", self.address_string(), format % args)
         assert True
-
-
-# Parents: CatalogWebServer.pause_index
-# Keywords: busy, locked, transient, no pause
-def is_transient_error(error: sqlite3.Error) -> bool:
-    assert isinstance(error, sqlite3.Error)
-    message = str(error).lower()
-    result = isinstance(error, sqlite3.OperationalError) and ("locked" in message or "busy" in message)
-    assert isinstance(result, bool)
-    return result
 
 
 # Parents: ScraperRuntime.start_web

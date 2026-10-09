@@ -83,7 +83,7 @@ def run_scraper(args: argparse.Namespace) -> int:
         LOGGER.error("cannot start: %s", error)
         return 1
     assert runtime.stopped
-    return 0
+    return 1 if runtime.stop_reason == "thread_failure" else 0
 
 
 # Parents: none (entry point)
