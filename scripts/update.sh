@@ -64,7 +64,7 @@ apply() {
     export DHT_REVISION
     compose "$DHT_PROJECT" build --pull || rollback "$previous" "$running" "the new image did not build"
     if [ -n "$running" ]; then
-        compose "$DHT_PROJECT" up -d --wait --wait-timeout 300 --remove-orphans || rollback "$previous" "$running" "the new version did not start"
+        compose "$DHT_PROJECT" up -d --wait --wait-timeout "$DHT_WAIT_TIMEOUT" --remove-orphans || rollback "$previous" "$running" "the new version did not start"
         say "updated to ${current:0:12}, service restarted at $(web_url "$DHT_PROJECT")"
     else
         say "updated to ${current:0:12}; the service is not running, nothing started"
@@ -82,7 +82,7 @@ rollback() {
     export DHT_REVISION
     compose "$DHT_PROJECT" build || say "rebuilding the previous version failed too" >&2
     if [ -n "$running" ]; then
-        compose "$DHT_PROJECT" up -d --wait --wait-timeout 300 || say "restarting the previous version failed too" >&2
+        compose "$DHT_PROJECT" up -d --wait --wait-timeout "$DHT_WAIT_TIMEOUT" || say "restarting the previous version failed too" >&2
     fi
     exit 1
 }

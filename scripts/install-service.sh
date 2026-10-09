@@ -74,7 +74,7 @@ install_service() {
     export DHT_REVISION
     say "installing the service $DHT_PROJECT at ${DHT_REVISION:0:12}"
     compose "$DHT_PROJECT" build
-    compose "$DHT_PROJECT" up -d --wait --wait-timeout 300 --remove-orphans
+    compose "$DHT_PROJECT" up -d --wait --wait-timeout "$DHT_WAIT_TIMEOUT" --remove-orphans
     mkdir -p "$DHT_LOG_DIR"
     install_cron_line
     say "service running at $(web_url "$DHT_PROJECT")"

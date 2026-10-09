@@ -80,7 +80,7 @@ main() {
     trap 'exit 143' TERM
     trap 'HUNG_UP=1; exit 129' HUP
     start_watchdog
-    compose "$RUN_PROJECT" up -d --wait --wait-timeout 300 --no-build --remove-orphans
+    compose "$RUN_PROJECT" up -d --wait --wait-timeout "$DHT_WAIT_TIMEOUT" --no-build --remove-orphans
     local scraper
     scraper=$(compose "$RUN_PROJECT" ps -q scraper)
     say "DHT scraper running at $(web_url "$RUN_PROJECT"); stop with Ctrl-C"

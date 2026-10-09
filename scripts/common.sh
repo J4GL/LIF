@@ -4,6 +4,8 @@
 
 DHT_REPO=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 DHT_PROJECT=${DHT_PROJECT:-dht-scraper}
+# Seconds each `up --wait` waits for a healthy scraper: a new version may migrate a large database first.
+DHT_WAIT_TIMEOUT=${DHT_WAIT_TIMEOUT:-2000}
 DHT_ENV_FILE=${DHT_ENV_FILE:-$DHT_REPO/.env}
 if [ -z "${DHT_LOG_DIR:-}" ]; then
     if [ "$(uname -s)" = Darwin ]; then
@@ -13,7 +15,7 @@ if [ -z "${DHT_LOG_DIR:-}" ]; then
     fi
 fi
 DOCKER_CLI_HINTS=false
-export DHT_PROJECT DHT_ENV_FILE DHT_LOG_DIR DOCKER_CLI_HINTS
+export DHT_PROJECT DHT_WAIT_TIMEOUT DHT_ENV_FILE DHT_LOG_DIR DOCKER_CLI_HINTS
 DHT_LOCK_DIR=""
 
 say() {

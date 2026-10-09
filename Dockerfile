@@ -14,7 +14,7 @@ COPY dht_scraper/ ./dht_scraper/
 USER 10001:10001
 EXPOSE 8080/tcp 6881-6888/udp
 
-HEALTHCHECK --interval=30s --timeout=3s --start-period=60s --start-interval=1s \
+HEALTHCHECK --interval=30s --timeout=3s --start-period=1800s --start-interval=1s \
     CMD ["python3", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/api/stats', timeout=2).read()"]
 
 ENTRYPOINT ["python3", "-m", "dht_scraper", "--no-browser", "--web-host", "0.0.0.0"]

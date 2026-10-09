@@ -109,6 +109,34 @@ class UpdateScriptSpecTest(unittest.TestCase):
                     self.assertFalse([call for call in calls if call["sub"] == "up" and call["revision"] == new])
                 self.assertEqual(sandbox.deployed_revision(), old)
 
+    def test_DEPLOY_022_slow_start_wait(self):
+        def wait_timeout(call):
+            return call["argv"][call["argv"].index("--wait-timeout") + 1]
+
+        sandbox = installed(self)
+        new = sandbox.push_commit()
+        result = sandbox.run("update.sh")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        up = [call for call in sandbox.compose_calls(PROJECT, "up") if call["revision"] == new][0]
+        self.assertEqual(wait_timeout(up), "2000")
+        self.assertIn("--start-period=1800s", read_text(os.path.join(sandbox.repo, "Dockerfile")))
+
+        sandbox = installed(self)
+        sandbox.environment["DHT_WAIT_TIMEOUT"] = "45"
+        new = sandbox.push_commit()
+        result = sandbox.run("update.sh")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(wait_timeout([call for call in sandbox.compose_calls(PROJECT, "up") if call["revision"] == new][0]), "45")
+
+        sandbox = installed(self)
+        new = sandbox.push_commit()
+        with sandbox.state() as state:
+            state["fail"]["up"] = [new]
+        result = sandbox.run("update.sh")
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        last = sandbox.compose_calls(PROJECT)[-1]
+        self.assertEqual((last["sub"], wait_timeout(last)), ("up", "2000"))
+
     def test_DEPLOY_019_interrupted_update_resumed(self):
         sandbox = installed(self)
         new = sandbox.push_commit()
